@@ -1,0 +1,15 @@
+[package]
+name = "sftp"
+version = "0.1.0"
+publish = false
+authors = ["Yusuke Sasaki <yusuke.sasaki.nuem@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+
+[dev-dependencies]
+anyhow = "1"
+ssh2 = "0.9"
+tracing = "0.1"
+tracing-subscriber = "0.1"
+whoami = "1"
