@@ -1,12 +1,12 @@
 //! A pure-Rust implementation of SFTP client independent to transport layer.
 
+use crate::consts::*;
 use byteorder::{NetworkEndian, ReadBytesExt as _, WriteBytesExt as _};
 use std::{
     borrow::Cow,
     ffi::{OsStr, OsString},
     io::{self, prelude::*},
     os::unix::prelude::*,
-    path::Path,
 };
 
 // Refs:
@@ -14,54 +14,64 @@ use std::{
 // * https://tools.ietf.org/html/rfc4251
 // * https://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/sftp-server.c?rev=1.120&content-type=text/x-cvsweb-markup
 
-const SFTP_PROTOCOL_VERSION: u32 = 3;
+pub mod consts {
+    pub const SFTP_PROTOCOL_VERSION: u32 = 3;
 
-// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-3
-const SSH_FXP_INIT: u8 = 1;
-const SSH_FXP_VERSION: u8 = 2;
-const SSH_FXP_OPEN: u8 = 3;
-const SSH_FXP_CLOSE: u8 = 4;
-const SSH_FXP_READ: u8 = 5;
-const SSH_FXP_WRITE: u8 = 6;
-const SSH_FXP_LSTAT: u8 = 7;
-const SSH_FXP_FSTAT: u8 = 8;
-const SSH_FXP_SETSTAT: u8 = 9;
-const SSH_FXP_FSETSTAT: u8 = 10;
-const SSH_FXP_OPENDIR: u8 = 11;
-const SSH_FXP_READDIR: u8 = 12;
-const SSH_FXP_REMOVE: u8 = 13;
-const SSH_FXP_MKDIR: u8 = 14;
-const SSH_FXP_RMDIR: u8 = 15;
-const SSH_FXP_REALPATH: u8 = 16;
-const SSH_FXP_STAT: u8 = 17;
-const SSH_FXP_RENAME: u8 = 18;
-const SSH_FXP_READLINK: u8 = 19;
-const SSH_FXP_SYMLINK: u8 = 20;
-const SSH_FXP_STATUS: u8 = 101;
-const SSH_FXP_HANDLE: u8 = 102;
-const SSH_FXP_DATA: u8 = 103;
-const SSH_FXP_NAME: u8 = 104;
-const SSH_FXP_ATTRS: u8 = 105;
-const SSH_FXP_EXTENDED: u8 = 200;
-const SSH_FXP_EXTENDED_REPLY: u8 = 201;
+    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-3
+    pub const SSH_FXP_INIT: u8 = 1;
+    pub const SSH_FXP_VERSION: u8 = 2;
+    pub const SSH_FXP_OPEN: u8 = 3;
+    pub const SSH_FXP_CLOSE: u8 = 4;
+    pub const SSH_FXP_READ: u8 = 5;
+    pub const SSH_FXP_WRITE: u8 = 6;
+    pub const SSH_FXP_LSTAT: u8 = 7;
+    pub const SSH_FXP_FSTAT: u8 = 8;
+    pub const SSH_FXP_SETSTAT: u8 = 9;
+    pub const SSH_FXP_FSETSTAT: u8 = 10;
+    pub const SSH_FXP_OPENDIR: u8 = 11;
+    pub const SSH_FXP_READDIR: u8 = 12;
+    pub const SSH_FXP_REMOVE: u8 = 13;
+    pub const SSH_FXP_MKDIR: u8 = 14;
+    pub const SSH_FXP_RMDIR: u8 = 15;
+    pub const SSH_FXP_REALPATH: u8 = 16;
+    pub const SSH_FXP_STAT: u8 = 17;
+    pub const SSH_FXP_RENAME: u8 = 18;
+    pub const SSH_FXP_READLINK: u8 = 19;
+    pub const SSH_FXP_SYMLINK: u8 = 20;
+    pub const SSH_FXP_STATUS: u8 = 101;
+    pub const SSH_FXP_HANDLE: u8 = 102;
+    pub const SSH_FXP_DATA: u8 = 103;
+    pub const SSH_FXP_NAME: u8 = 104;
+    pub const SSH_FXP_ATTRS: u8 = 105;
+    pub const SSH_FXP_EXTENDED: u8 = 200;
+    pub const SSH_FXP_EXTENDED_REPLY: u8 = 201;
 
-// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-7
-const SSH_FX_OK: u32 = 0;
-const SSH_FX_EOF: u32 = 1;
-const SSH_FX_NO_SUCH_FILE: u32 = 2;
-const SSH_FX_PERMISSION_DENIED: u32 = 3;
-const SSH_FX_FAILURE: u32 = 4;
-const SSH_FX_BAD_MESSAGE: u32 = 5;
-const SSH_FX_NO_CONNECTION: u32 = 6;
-const SSH_FX_CONNECTION_LOST: u32 = 7;
-const SSH_FX_OP_UNSUPPORTED: u32 = 8;
+    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-7
+    pub const SSH_FX_OK: u32 = 0;
+    pub const SSH_FX_EOF: u32 = 1;
+    pub const SSH_FX_NO_SUCH_FILE: u32 = 2;
+    pub const SSH_FX_PERMISSION_DENIED: u32 = 3;
+    pub const SSH_FX_FAILURE: u32 = 4;
+    pub const SSH_FX_BAD_MESSAGE: u32 = 5;
+    pub const SSH_FX_NO_CONNECTION: u32 = 6;
+    pub const SSH_FX_CONNECTION_LOST: u32 = 7;
+    pub const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 
-// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
-const SSH_FILEXFER_ATTR_SIZE: u32 = 0x00000001;
-const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x00000002;
-const SSH_FILEXFER_ATTR_PERMISSIONS: u32 = 0x00000004;
-const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x00000008;
-const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x80000000;
+    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
+    pub const SSH_FILEXFER_ATTR_SIZE: u32 = 0x00000001;
+    pub const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x00000002;
+    pub const SSH_FILEXFER_ATTR_PERMISSIONS: u32 = 0x00000004;
+    pub const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x00000008;
+    pub const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x80000000;
+
+    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-6.3
+    pub const SSH_FXF_READ: u32 = 0x00000001;
+    pub const SSH_FXF_WRITE: u32 = 0x00000002;
+    pub const SSH_FXF_APPEND: u32 = 0x00000004;
+    pub const SSH_FXF_CREAT: u32 = 0x00000008;
+    pub const SSH_FXF_TRUNC: u32 = 0x00000010;
+    pub const SSH_FXF_EXCL: u32 = 0x00000020;
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -160,17 +170,17 @@ where
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub fn stat(&mut self, path: impl AsRef<Path>) -> Result<RequestId> {
-        self.stat_common(SSH_FXP_STAT, path.as_ref().as_os_str())
+    pub fn send_stat(&mut self, path: impl AsRef<OsStr>) -> Result<RequestId> {
+        self.send_stat_common(SSH_FXP_STAT, path.as_ref())
     }
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
     #[inline]
-    pub fn lstat(&mut self, path: impl AsRef<Path>) -> Result<RequestId> {
-        self.stat_common(SSH_FXP_LSTAT, path.as_ref().as_os_str())
+    pub fn send_lstat(&mut self, path: impl AsRef<OsStr>) -> Result<RequestId> {
+        self.send_stat_common(SSH_FXP_LSTAT, path.as_ref())
     }
 
-    fn stat_common(&mut self, typ: u8, path: &OsStr) -> Result<RequestId> {
+    fn send_stat_common(&mut self, typ: u8, path: &OsStr) -> Result<RequestId> {
         let path_len = path.len() as u32;
         self.send_request(
             typ,
@@ -178,6 +188,52 @@ where
             |stream| {
                 stream.write_u32::<NetworkEndian>(path_len)?;
                 stream.write_all(path.as_bytes())?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Request to open a file.
+    pub fn send_open(&mut self, filename: impl AsRef<OsStr>, pflags: u32) -> Result<RequestId> {
+        let filename = filename.as_ref();
+        let data_len = 4 + filename.len() as u32 + 4 + 4; // filename_len(4byte) + filename + pflags + attr_flags;
+
+        self.send_request(SSH_FXP_OPEN, data_len, |stream| {
+            stream.write_u32::<NetworkEndian>(filename.len() as u32)?;
+            stream.write_all(filename.as_bytes())?;
+            stream.write_u32::<NetworkEndian>(pflags)?;
+
+            // TODO: write `attrs` field
+            stream.write_u32::<NetworkEndian>(0u32)?;
+
+            Ok(())
+        })
+    }
+
+    pub fn send_read(&mut self, handle: &FileHandle, offset: u64, len: u32) -> Result<RequestId> {
+        let FileHandle(ref handle) = handle;
+        self.send_request(
+            SSH_FXP_READ,
+            4 + handle.len() as u32 + 8 + 4, // len(u32) + handle + offset(u64) + len(u32)
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
+                stream.write_all(handle.as_bytes())?;
+                stream.write_u64::<NetworkEndian>(offset)?;
+                stream.write_u32::<NetworkEndian>(len)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Request to close a file corresponding to the specified handle.
+    pub fn send_close(&mut self, handle: &FileHandle) -> Result<RequestId> {
+        let FileHandle(ref handle) = handle;
+        self.send_request(
+            SSH_FXP_CLOSE,
+            4 + handle.len() as u32, // len(u32) + handle
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
+                stream.write_all(handle.as_bytes())?;
                 Ok(())
             },
         )
@@ -209,6 +265,18 @@ where
                     message,
                     language_tag,
                 }
+            }
+
+            SSH_FXP_HANDLE => {
+                let handle = read_packet_string(&mut stream)?.ok_or_else(|| Error::Protocol {
+                    msg: "missing handle string".into(),
+                })?;
+                Response::Handle(FileHandle(handle))
+            }
+
+            SSH_FXP_DATA => {
+                let data = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
+                Response::Data(data.into_vec())
             }
 
             SSH_FXP_ATTRS => {
@@ -277,12 +345,21 @@ pub enum Response {
         language_tag: Option<OsString>,
     },
 
+    /// An opened file handle.
+    Handle(FileHandle),
+
+    /// Received data.
+    Data(Vec<u8>),
+
     /// Retrieved attribute values.
     Attrs(FileAttr),
 
     /// The response type is unknown or currently not supported.
     Unknown { typ: u8, data: Vec<u8> },
 }
+
+#[derive(Debug)]
+pub struct FileHandle(OsString);
 
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
 #[derive(Debug)]

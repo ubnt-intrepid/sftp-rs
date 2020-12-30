@@ -29,17 +29,75 @@ fn main() -> Result<()> {
     let mut sftp = sftp::Session::init(channel).context("failed to init SFTP")?;
     tracing::debug!("extensions: {:?}", sftp.extensions());
 
-    let id = sftp.stat(".")?;
-    tracing::debug!("send response (id={})", id);
+    let _id = sftp.send_stat(".")?;
+    tracing::debug!("stat(\".\")");
+    match sftp.receive_response()? {
+        (_id, sftp::Response::Attrs(attr)) => {
+            tracing::debug!("--> {:?}", attr);
+        }
+        (_id, resp) => {
+            tracing::error!("invalid response type: {:?}", resp);
+            return Ok(());
+        }
+    }
 
-    let res = sftp.receive_response()?;
-    tracing::debug!("--> {:?}", res);
+    let _id = sftp.send_open(".bashrc", sftp::consts::SSH_FXF_READ)?;
+    tracing::debug!("open(\".bashrc\")");
+    let handle = match sftp.receive_response()? {
+        (_id, sftp::Response::Handle(handle)) => {
+            tracing::debug!("--> ok(handle = {:?})", handle);
+            handle
+        }
+        (_id, sftp::Response::Status { code, message, .. }) => {
+            tracing::debug!("--> error(code = {}, message = {:?})", code, message);
+            return Ok(());
+        }
 
-    let id = sftp.stat("./a")?;
-    tracing::debug!("send response (id={})", id);
+        (_id, resp) => {
+            tracing::error!("invalid response type: {:?}", resp);
+            return Ok(());
+        }
+    };
 
-    let res = sftp.receive_response()?;
-    tracing::debug!("--> {:?}", res);
+    let _id = sftp.send_read(&handle, 0, 32)?;
+    tracing::debug!("read(0..32)");
+    match sftp.receive_response()? {
+        (_id, sftp::Response::Data(data)) => {
+            tracing::debug!("--> ok(data = {:?})", data);
+        }
+        (_id, sftp::Response::Status { code, message, .. }) => {
+            tracing::debug!("--> error(code = {}, message = {:?})", code, message);
+            return Ok(());
+        }
+
+        (_id, resp) => {
+            tracing::error!("invalid response type: {:?}", resp);
+            return Ok(());
+        }
+    }
+
+    let _id = sftp.send_close(&handle)?;
+    tracing::debug!("close()");
+    match sftp.receive_response()? {
+        (
+            _id,
+            sftp::Response::Status {
+                code: sftp::consts::SSH_FX_OK,
+                ..
+            },
+        ) => {
+            tracing::debug!("--> ok");
+        }
+
+        (_id, sftp::Response::Status { code, message, .. }) => {
+            tracing::debug!("--> error(code = {}, message = {:?})", code, message);
+        }
+
+        (_id, resp) => {
+            tracing::error!("invalid response type: {:?}", resp);
+            return Ok(());
+        }
+    };
 
     Ok(())
 }
