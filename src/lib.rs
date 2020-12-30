@@ -1,9 +1,9 @@
-#![allow(dead_code)]
+//! A pure-Rust implementation of SFTP client independent to transport layer.
 
 use byteorder::{NetworkEndian, ReadBytesExt as _, WriteBytesExt as _};
 use std::{
     borrow::Cow,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{self, prelude::*},
     os::unix::prelude::*,
     path::Path,
@@ -74,19 +74,22 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The type alias of identifier numbers assigned to each request.
 pub type RequestId = u32;
 
+/// SFTP session.
 #[derive(Debug)]
-pub struct SFTP<I> {
+pub struct Session<I> {
     stream: I,
     extensions: Vec<(OsString, OsString)>,
     next_request_id: u32,
 }
 
-impl<I> SFTP<I>
+impl<I> Session<I>
 where
     I: io::Read + io::Write,
 {
+    /// Start a SFTP session.
     pub fn init(mut stream: I) -> Result<Self> {
         // send SSH_FXP_INIT packet.
         stream.write_u32::<NetworkEndian>(5)?; // length = type(= 1byte) + version(= 4byte)
@@ -131,6 +134,8 @@ where
         })
     }
 
+    /// Return a list of extensions.
+    #[inline]
     pub fn extensions(&self) -> &[(OsString, OsString)] {
         &self.extensions
     }
@@ -153,12 +158,22 @@ where
         Ok(request_id)
     }
 
-    pub fn stat(&mut self, path: impl AsRef<Path>) -> Result<u32> {
-        let path = path.as_ref().as_os_str();
-        let path_len = path.len() as u32;
+    /// Request to retrieve attribute values for a named file.
+    #[inline]
+    pub fn stat(&mut self, path: impl AsRef<Path>) -> Result<RequestId> {
+        self.stat_common(SSH_FXP_STAT, path.as_ref().as_os_str())
+    }
 
+    /// Request to retrieve attribute values for a named file, without following symbolic links.
+    #[inline]
+    pub fn lstat(&mut self, path: impl AsRef<Path>) -> Result<RequestId> {
+        self.stat_common(SSH_FXP_LSTAT, path.as_ref().as_os_str())
+    }
+
+    fn stat_common(&mut self, typ: u8, path: &OsStr) -> Result<RequestId> {
+        let path_len = path.len() as u32;
         self.send_request(
-            SSH_FXP_STAT,
+            typ,
             4 + path_len, // len(u32) + path
             |stream| {
                 stream.write_u32::<NetworkEndian>(path_len)?;
@@ -168,6 +183,7 @@ where
         )
     }
 
+    /// Retrieve a response packet from the peer.
     pub fn receive_response(&mut self) -> Result<(RequestId, Response)> {
         let length = self.stream.read_u32::<NetworkEndian>()?;
         let mut stream = io::Read::take(&mut self.stream, length as u64);
@@ -250,19 +266,22 @@ where
     }
 }
 
+/// The kind of response values received from the server.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Response {
+    /// The operation is failed.
     Status {
         code: u32,
         message: OsString,
         language_tag: Option<OsString>,
     },
+
+    /// Retrieved attribute values.
     Attrs(FileAttr),
-    Unknown {
-        typ: u8,
-        data: Vec<u8>,
-    },
+
+    /// The response type is unknown or currently not supported.
+    Unknown { typ: u8, data: Vec<u8> },
 }
 
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5

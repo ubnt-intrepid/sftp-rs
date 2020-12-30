@@ -26,7 +26,7 @@ fn main() -> Result<()> {
 
     // TODO: communicate SFTP
 
-    let mut sftp = sftp::SFTP::init(channel).context("failed to init SFTP")?;
+    let mut sftp = sftp::Session::init(channel).context("failed to init SFTP")?;
     tracing::debug!("extensions: {:?}", sftp.extensions());
 
     let id = sftp.stat(".")?;
