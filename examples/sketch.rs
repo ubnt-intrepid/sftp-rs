@@ -26,12 +26,11 @@ fn main() -> Result<()> {
 
     // TODO: communicate SFTP
 
-    sftp::send_init_packet(&mut channel).context("failed to send SSH_FXP_INIT request packet")?;
-    tracing::debug!("send SSH_FXP_INIT");
+    let mut sftp = sftp::SFTP::init(channel).context("failed to init SFTP")?;
+    tracing::debug!("extensions: {:?}", sftp.extensions());
 
-    let resp = sftp::receive_init_packet(&mut channel)
-        .context("failed to receive SSH_FXP_VERSION response packet")?;
-    tracing::debug!("--> {:?}", resp);
+    let res = sftp.stat(".");
+    tracing::debug!("{:?}", res);
 
     Ok(())
 }
