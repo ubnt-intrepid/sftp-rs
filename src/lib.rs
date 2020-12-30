@@ -210,6 +210,7 @@ where
         })
     }
 
+    /// Request to read a range of data from an opened file corresponding to the specified handle.
     pub fn send_read(&mut self, handle: &FileHandle, offset: u64, len: u32) -> Result<RequestId> {
         let FileHandle(ref handle) = handle;
         self.send_request(
@@ -220,6 +221,28 @@ where
                 stream.write_all(handle.as_bytes())?;
                 stream.write_u64::<NetworkEndian>(offset)?;
                 stream.write_u32::<NetworkEndian>(len)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Request to write a range of data to an opened file corresponding to the specified handle.
+    pub fn send_write(
+        &mut self,
+        handle: &FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<RequestId> {
+        let FileHandle(ref handle) = handle;
+        self.send_request(
+            SSH_FXP_WRITE,
+            4 + handle.len() as u32 + 8 + 4 + data.len() as u32, // len(u32) + handle + offset(u64) + data_len(u32) + data
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
+                stream.write_all(handle.as_bytes())?;
+                stream.write_u64::<NetworkEndian>(offset)?;
+                stream.write_u32::<NetworkEndian>(data.len() as u32)?;
+                stream.write_all(data)?;
                 Ok(())
             },
         )

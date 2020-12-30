@@ -41,8 +41,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let _id = sftp.send_open(".bashrc", sftp::consts::SSH_FXF_READ)?;
-    tracing::debug!("open(\".bashrc\")");
+    let _id = sftp.send_open(
+        "test.txt",
+        sftp::consts::SSH_FXF_WRITE | sftp::consts::SSH_FXF_TRUNC,
+    )?;
+    tracing::debug!("open(\"test.txt\")");
     let handle = match sftp.receive_response()? {
         (_id, sftp::Response::Handle(handle)) => {
             tracing::debug!("--> ok(handle = {:?})", handle);
@@ -59,12 +62,19 @@ fn main() -> Result<()> {
         }
     };
 
-    let _id = sftp.send_read(&handle, 0, 32)?;
-    tracing::debug!("read(0..32)");
+    let _id = sftp.send_write(&handle, 0, b"Hello, from SFTP!\n")?;
+    tracing::debug!("write(..)");
     match sftp.receive_response()? {
-        (_id, sftp::Response::Data(data)) => {
-            tracing::debug!("--> ok(data = {:?})", data);
+        (
+            _id,
+            sftp::Response::Status {
+                code: sftp::consts::SSH_FX_OK,
+                ..
+            },
+        ) => {
+            tracing::debug!("--> ok");
         }
+
         (_id, sftp::Response::Status { code, message, .. }) => {
             tracing::debug!("--> error(code = {}, message = {:?})", code, message);
             return Ok(());
