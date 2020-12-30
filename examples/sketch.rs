@@ -29,8 +29,17 @@ fn main() -> Result<()> {
     let mut sftp = sftp::SFTP::init(channel).context("failed to init SFTP")?;
     tracing::debug!("extensions: {:?}", sftp.extensions());
 
-    let res = sftp.stat(".");
-    tracing::debug!("{:?}", res);
+    let id = sftp.stat(".")?;
+    tracing::debug!("send response (id={})", id);
+
+    let res = sftp.receive_response()?;
+    tracing::debug!("--> {:?}", res);
+
+    let id = sftp.stat("./a")?;
+    tracing::debug!("send response (id={})", id);
+
+    let res = sftp.receive_response()?;
+    tracing::debug!("--> {:?}", res);
 
     Ok(())
 }

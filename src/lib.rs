@@ -3,7 +3,6 @@
 use byteorder::{NetworkEndian, ReadBytesExt as _, WriteBytesExt as _};
 use std::{
     borrow::Cow,
-    convert::TryFrom,
     ffi::OsString,
     io::{self, prelude::*},
     os::unix::prelude::*,
@@ -57,6 +56,13 @@ const SSH_FX_NO_CONNECTION: u32 = 6;
 const SSH_FX_CONNECTION_LOST: u32 = 7;
 const SSH_FX_OP_UNSUPPORTED: u32 = 8;
 
+// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
+const SSH_FILEXFER_ATTR_SIZE: u32 = 0x00000001;
+const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x00000002;
+const SSH_FILEXFER_ATTR_PERMISSIONS: u32 = 0x00000004;
+const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x00000008;
+const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x80000000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("errored in underlying transport I/O")]
@@ -64,16 +70,11 @@ pub enum Error {
 
     #[error("protocol error")]
     Protocol { msg: Cow<'static, str> },
-
-    #[error("from remote")]
-    Remote {
-        code: u32,
-        message: OsString,
-        language_tag: Option<OsString>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub type RequestId = u32;
 
 #[derive(Debug)]
 pub struct SFTP<I> {
@@ -134,102 +135,146 @@ where
         &self.extensions
     }
 
-    pub fn stat(&mut self, path: impl AsRef<Path>) -> Result<FileStat> {
-        // send packet
-        let path = path.as_ref().as_os_str();
-        let path_len = path.len() as u32;
-
-        let length = u32::try_from(1 + 4 + 4 + path.len()) // type(1 byte) + id(4 byte) + path_len(4 byte) + path
-            .expect("path name is too large");
-
+    fn send_request<F>(&mut self, packet_type: u8, data_len: u32, f: F) -> Result<RequestId>
+    where
+        F: FnOnce(&mut I) -> Result<()>,
+    {
         let request_id = self.next_request_id;
+        let length = 1 + 4 + data_len; // type(1 byte) + id(4 byte) + data_len
 
         self.stream.write_u32::<NetworkEndian>(length)?;
-        self.stream.write_u8(SSH_FXP_STAT)?;
+        self.stream.write_u8(packet_type)?;
         self.stream.write_u32::<NetworkEndian>(request_id)?;
-        self.stream.write_u32::<NetworkEndian>(path_len)?;
-        self.stream.write_all(path.as_bytes())?;
+        f(&mut self.stream)?;
         self.stream.flush()?;
 
         self.next_request_id = self.next_request_id.wrapping_add(1);
 
-        // receive packet
+        Ok(request_id)
+    }
+
+    pub fn stat(&mut self, path: impl AsRef<Path>) -> Result<u32> {
+        let path = path.as_ref().as_os_str();
+        let path_len = path.len() as u32;
+
+        self.send_request(
+            SSH_FXP_STAT,
+            4 + path_len, // len(u32) + path
+            |stream| {
+                stream.write_u32::<NetworkEndian>(path_len)?;
+                stream.write_all(path.as_bytes())?;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn receive_response(&mut self) -> Result<(RequestId, Response)> {
         let length = self.stream.read_u32::<NetworkEndian>()?;
         let mut stream = io::Read::take(&mut self.stream, length as u64);
 
-        let packet_type = match stream.read_u8()? {
-            typ @ SSH_FXP_ATTRS | typ @ SSH_FXP_STATUS => typ,
-            typ => {
-                return Err(Error::Protocol {
-                    msg: format!("incorrect message type: {}", typ).into(),
-                });
+        let typ = stream.read_u8()?;
+        let request_id = stream.read_u32::<NetworkEndian>()?;
+
+        let response = match typ {
+            SSH_FXP_STATUS => {
+                let code = stream.read_u32::<NetworkEndian>()?;
+                let message = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
+                let language_tag = read_packet_string(&mut stream)? //
+                    .and_then(|msg| {
+                        if msg.is_empty() {
+                            None
+                        } else {
+                            Some(msg)
+                        }
+                    });
+
+                Response::Status {
+                    code,
+                    message,
+                    language_tag,
+                }
             }
-        };
 
-        if stream.read_u32::<NetworkEndian>()? != request_id {
-            return Err(Error::Protocol {
-                msg: "incorrect request id".into(),
-            });
-        }
-
-        match packet_type {
             SSH_FXP_ATTRS => {
                 let flags = stream.read_u32::<NetworkEndian>()?;
-                let size = stream.read_u64::<NetworkEndian>()?;
-                let uid = stream.read_u32::<NetworkEndian>()?;
-                let gid = stream.read_u32::<NetworkEndian>()?;
-                let permissions = stream.read_u32::<NetworkEndian>()?;
-                let atime = stream.read_u32::<NetworkEndian>()?;
-                let mtime = stream.read_u32::<NetworkEndian>()?;
+                let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
+                    Some(stream.read_u64::<NetworkEndian>()?)
+                } else {
+                    None
+                };
+                let (uid, gid) = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+                    let uid = stream.read_u32::<NetworkEndian>()?;
+                    let gid = stream.read_u32::<NetworkEndian>()?;
+                    (Some(uid), Some(gid))
+                } else {
+                    (None, None)
+                };
+                let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+                    Some(stream.read_u32::<NetworkEndian>()?)
+                } else {
+                    None
+                };
+                let (atime, mtime) = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+                    let atime = stream.read_u32::<NetworkEndian>()?;
+                    let mtime = stream.read_u32::<NetworkEndian>()?;
+                    (Some(atime), Some(mtime))
+                } else {
+                    (None, None)
+                };
 
-                let mut buf = vec![];
-                stream.read_to_end(&mut buf)?;
+                // TODO: parse extended data
+                let mut data = vec![];
+                stream.read_to_end(&mut data)?;
+                drop(data);
 
-                Ok(FileStat {
-                    flags,
+                Response::Attrs(FileAttr {
                     size,
                     uid,
                     gid,
                     permissions,
                     atime,
                     mtime,
-                    data: buf,
                 })
             }
 
-            SSH_FXP_STATUS => {
-                let code = stream.read_u32::<NetworkEndian>()?;
-                let message = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
-                let language_tag = read_packet_string(&mut stream)?.and_then(|msg| {
-                    if msg.is_empty() {
-                        None
-                    } else {
-                        Some(msg)
-                    }
-                });
-                Err(Error::Remote {
-                    code,
-                    message,
-                    language_tag,
-                })
+            typ => {
+                let mut data = vec![];
+                stream.read_to_end(&mut data)?;
+                Response::Unknown { typ, data }
             }
+        };
 
-            _ => unreachable!(),
-        }
+        debug_assert_eq!(stream.limit(), 0);
+
+        Ok((request_id, response))
     }
 }
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct FileStat {
-    flags: u32,
-    size: u64,
-    uid: u32,
-    gid: u32,
-    permissions: u32,
-    atime: u32,
-    mtime: u32,
-    data: Vec<u8>,
+pub enum Response {
+    Status {
+        code: u32,
+        message: OsString,
+        language_tag: Option<OsString>,
+    },
+    Attrs(FileAttr),
+    Unknown {
+        typ: u8,
+        data: Vec<u8>,
+    },
+}
+
+// described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct FileAttr {
+    pub size: Option<u64>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub permissions: Option<u32>,
+    pub atime: Option<u32>,
+    pub mtime: Option<u32>,
 }
 
 fn read_packet_string<R>(mut reader: R) -> Result<Option<OsString>>
