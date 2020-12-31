@@ -366,7 +366,7 @@ where
         }
     }
 
-    /// Request to open a directory for reading.
+    /// Request to list files and directories contained in an opened directory.
     pub fn readdir(&mut self, handle: &FileHandle) -> Result<Result<Vec<DirEntry>, RemoteError>> {
         let FileHandle(handle) = handle;
         let handle_len = handle.len() as u32;
@@ -383,6 +383,29 @@ where
 
         match self.receive_response(request_id)? {
             Response::Name(entries) => Ok(Ok(entries)),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn realpath(&mut self, path: impl AsRef<OsStr>) -> Result<Result<OsString, RemoteError>> {
+        let path = path.as_ref();
+        let path_len = path.len() as u32;
+
+        let request_id = self.send_request(
+            SSH_FXP_REALPATH,
+            4 + path_len, // len(u32) + path
+            |stream| {
+                stream.write_u32::<NetworkEndian>(path_len)?;
+                stream.write_all(path.as_bytes())?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Name(mut entries) => Ok(Ok(entries.remove(0).filename)),
             Response::Status(st) => Ok(Err(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),

@@ -57,6 +57,21 @@ fn main() -> Result<()> {
         }
     }
 
+    tracing::debug!("realpath(\".\")");
+    match sftp.realpath(".")? {
+        Ok(path) => {
+            tracing::debug!("--> ok(path = {:?})", path);
+        }
+        Err(err) => {
+            tracing::debug!(
+                "--> error(code = {}, message = {:?})",
+                err.code(),
+                err.message()
+            );
+            return Ok(());
+        }
+    }
+
     tracing::debug!("opendir(\".\")");
     let handle = match sftp.opendir(".")? {
         Ok(handle) => {
