@@ -4,6 +4,7 @@ use crate::consts::*;
 use byteorder::{NetworkEndian, ReadBytesExt as _, WriteBytesExt as _};
 use std::{
     borrow::Cow,
+    collections::HashMap,
     ffi::{OsStr, OsString},
     io::{self, prelude::*},
     os::unix::prelude::*,
@@ -82,10 +83,16 @@ pub enum Error {
     Protocol { msg: Cow<'static, str> },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+#[derive(Debug, thiserror::Error)]
+#[error("from remote server")]
+#[non_exhaustive]
+pub struct RemoteError {
+    pub code: u32,
+    pub message: OsString,
+    pub language_tag: Option<OsString>,
+}
 
-/// The type alias of identifier numbers assigned to each request.
-pub type RequestId = u32;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// SFTP session.
 #[derive(Debug)]
@@ -93,6 +100,7 @@ pub struct Session<I> {
     stream: I,
     extensions: Vec<(OsString, OsString)>,
     next_request_id: u32,
+    pending_responses: HashMap<u32, Response>,
 }
 
 impl<I> Session<I>
@@ -141,6 +149,7 @@ where
             stream,
             extensions,
             next_request_id: 0,
+            pending_responses: HashMap::new(),
         })
     }
 
@@ -150,7 +159,203 @@ where
         &self.extensions
     }
 
-    fn send_request<F>(&mut self, packet_type: u8, data_len: u32, f: F) -> Result<RequestId>
+    /// Request to retrieve attribute values for a named file.
+    #[inline]
+    pub fn stat(&mut self, path: impl AsRef<OsStr>) -> Result<Result<FileAttr, RemoteError>> {
+        self.stat_common(SSH_FXP_STAT, path.as_ref())
+    }
+
+    /// Request to retrieve attribute values for a named file, without following symbolic links.
+    #[inline]
+    pub fn lstat(&mut self, path: impl AsRef<OsStr>) -> Result<Result<FileAttr, RemoteError>> {
+        self.stat_common(SSH_FXP_LSTAT, path.as_ref())
+    }
+
+    fn stat_common(&mut self, typ: u8, path: &OsStr) -> Result<Result<FileAttr, RemoteError>> {
+        let path_len = path.len() as u32;
+
+        let request_id = self.send_request(
+            typ,
+            4 + path_len, // len(u32) + path
+            |stream| {
+                stream.write_u32::<NetworkEndian>(path_len)?;
+                stream.write_all(path.as_bytes())?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Attrs(attrs) => Ok(Ok(attrs)),
+            Response::Status {
+                code,
+                message,
+                language_tag,
+                ..
+            } => Ok(Err(RemoteError {
+                code,
+                message,
+                language_tag,
+            })),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to open a file.
+    pub fn open(
+        &mut self,
+        filename: impl AsRef<OsStr>,
+        pflags: u32,
+    ) -> Result<Result<FileHandle, RemoteError>> {
+        let filename = filename.as_ref();
+        let data_len = 4 + filename.len() as u32 + 4 + 4; // filename_len(4byte) + filename + pflags + attr_flags;
+
+        let request_id = self.send_request(SSH_FXP_OPEN, data_len, |stream| {
+            stream.write_u32::<NetworkEndian>(filename.len() as u32)?;
+            stream.write_all(filename.as_bytes())?;
+            stream.write_u32::<NetworkEndian>(pflags)?;
+
+            // TODO: write `attrs` field
+            stream.write_u32::<NetworkEndian>(0u32)?;
+
+            Ok(())
+        })?;
+
+        match self.receive_response(request_id)? {
+            Response::Handle(handle) => Ok(Ok(handle)),
+            Response::Status {
+                code,
+                message,
+                language_tag,
+                ..
+            } => Ok(Err(RemoteError {
+                code,
+                message,
+                language_tag,
+            })),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to read a range of data from an opened file corresponding to the specified handle.
+    pub fn read(
+        &mut self,
+        handle: &FileHandle,
+        offset: u64,
+        len: u32,
+    ) -> Result<Result<Vec<u8>, RemoteError>> {
+        let FileHandle(ref handle) = handle;
+
+        let request_id = self.send_request(
+            SSH_FXP_READ,
+            4 + handle.len() as u32 + 8 + 4, // len(u32) + handle + offset(u64) + len(u32)
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
+                stream.write_all(handle.as_bytes())?;
+                stream.write_u64::<NetworkEndian>(offset)?;
+                stream.write_u32::<NetworkEndian>(len)?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Data(data) => Ok(Ok(data)),
+            Response::Status {
+                code,
+                message,
+                language_tag,
+                ..
+            } => Ok(Err(RemoteError {
+                code,
+                message,
+                language_tag,
+            })),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to write a range of data to an opened file corresponding to the specified handle.
+    pub fn write(
+        &mut self,
+        handle: &FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Result<(), RemoteError>> {
+        let FileHandle(ref handle) = handle;
+
+        let request_id = self.send_request(
+            SSH_FXP_WRITE,
+            4 + handle.len() as u32 + 8 + 4 + data.len() as u32, // len(u32) + handle + offset(u64) + data_len(u32) + data
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
+                stream.write_all(handle.as_bytes())?;
+                stream.write_u64::<NetworkEndian>(offset)?;
+                stream.write_u32::<NetworkEndian>(data.len() as u32)?;
+                stream.write_all(data)?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Status {
+                code: SSH_FX_OK, ..
+            } => Ok(Ok(())),
+            Response::Status {
+                code,
+                message,
+                language_tag,
+                ..
+            } => Ok(Err(RemoteError {
+                code,
+                message,
+                language_tag,
+            })),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to close a file corresponding to the specified handle.
+    pub fn close(&mut self, handle: &FileHandle) -> Result<Result<(), RemoteError>> {
+        let FileHandle(ref handle) = handle;
+
+        let request_id = self.send_request(
+            SSH_FXP_CLOSE,
+            4 + handle.len() as u32, // len(u32) + handle
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
+                stream.write_all(handle.as_bytes())?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Status {
+                code: SSH_FX_OK, ..
+            } => Ok(Ok(())),
+            Response::Status {
+                code,
+                message,
+                language_tag,
+                ..
+            } => Ok(Err(RemoteError {
+                code,
+                message,
+                language_tag,
+            })),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    fn send_request<F>(&mut self, packet_type: u8, data_len: u32, f: F) -> Result<u32>
     where
         F: FnOnce(&mut I) -> Result<()>,
     {
@@ -168,199 +373,114 @@ where
         Ok(request_id)
     }
 
-    /// Request to retrieve attribute values for a named file.
-    #[inline]
-    pub fn send_stat(&mut self, path: impl AsRef<OsStr>) -> Result<RequestId> {
-        self.send_stat_common(SSH_FXP_STAT, path.as_ref())
-    }
+    fn receive_response(&mut self, request_id: u32) -> Result<Response> {
+        if let Some(response) = self.pending_responses.remove(&request_id) {
+            return Ok(response);
+        }
 
-    /// Request to retrieve attribute values for a named file, without following symbolic links.
-    #[inline]
-    pub fn send_lstat(&mut self, path: impl AsRef<OsStr>) -> Result<RequestId> {
-        self.send_stat_common(SSH_FXP_LSTAT, path.as_ref())
-    }
+        loop {
+            let length = self.stream.read_u32::<NetworkEndian>()?;
+            let mut stream = io::Read::take(&mut self.stream, length as u64);
 
-    fn send_stat_common(&mut self, typ: u8, path: &OsStr) -> Result<RequestId> {
-        let path_len = path.len() as u32;
-        self.send_request(
-            typ,
-            4 + path_len, // len(u32) + path
-            |stream| {
-                stream.write_u32::<NetworkEndian>(path_len)?;
-                stream.write_all(path.as_bytes())?;
-                Ok(())
-            },
-        )
-    }
+            let typ = stream.read_u8()?;
+            let response_id = stream.read_u32::<NetworkEndian>()?;
 
-    /// Request to open a file.
-    pub fn send_open(&mut self, filename: impl AsRef<OsStr>, pflags: u32) -> Result<RequestId> {
-        let filename = filename.as_ref();
-        let data_len = 4 + filename.len() as u32 + 4 + 4; // filename_len(4byte) + filename + pflags + attr_flags;
+            let response = match typ {
+                SSH_FXP_STATUS => {
+                    let code = stream.read_u32::<NetworkEndian>()?;
+                    let message = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
+                    let language_tag = read_packet_string(&mut stream)? //
+                        .and_then(|msg| {
+                            if msg.is_empty() {
+                                None
+                            } else {
+                                Some(msg)
+                            }
+                        });
 
-        self.send_request(SSH_FXP_OPEN, data_len, |stream| {
-            stream.write_u32::<NetworkEndian>(filename.len() as u32)?;
-            stream.write_all(filename.as_bytes())?;
-            stream.write_u32::<NetworkEndian>(pflags)?;
-
-            // TODO: write `attrs` field
-            stream.write_u32::<NetworkEndian>(0u32)?;
-
-            Ok(())
-        })
-    }
-
-    /// Request to read a range of data from an opened file corresponding to the specified handle.
-    pub fn send_read(&mut self, handle: &FileHandle, offset: u64, len: u32) -> Result<RequestId> {
-        let FileHandle(ref handle) = handle;
-        self.send_request(
-            SSH_FXP_READ,
-            4 + handle.len() as u32 + 8 + 4, // len(u32) + handle + offset(u64) + len(u32)
-            |stream| {
-                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
-                stream.write_all(handle.as_bytes())?;
-                stream.write_u64::<NetworkEndian>(offset)?;
-                stream.write_u32::<NetworkEndian>(len)?;
-                Ok(())
-            },
-        )
-    }
-
-    /// Request to write a range of data to an opened file corresponding to the specified handle.
-    pub fn send_write(
-        &mut self,
-        handle: &FileHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<RequestId> {
-        let FileHandle(ref handle) = handle;
-        self.send_request(
-            SSH_FXP_WRITE,
-            4 + handle.len() as u32 + 8 + 4 + data.len() as u32, // len(u32) + handle + offset(u64) + data_len(u32) + data
-            |stream| {
-                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
-                stream.write_all(handle.as_bytes())?;
-                stream.write_u64::<NetworkEndian>(offset)?;
-                stream.write_u32::<NetworkEndian>(data.len() as u32)?;
-                stream.write_all(data)?;
-                Ok(())
-            },
-        )
-    }
-
-    /// Request to close a file corresponding to the specified handle.
-    pub fn send_close(&mut self, handle: &FileHandle) -> Result<RequestId> {
-        let FileHandle(ref handle) = handle;
-        self.send_request(
-            SSH_FXP_CLOSE,
-            4 + handle.len() as u32, // len(u32) + handle
-            |stream| {
-                stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
-                stream.write_all(handle.as_bytes())?;
-                Ok(())
-            },
-        )
-    }
-
-    /// Retrieve a response packet from the peer.
-    pub fn receive_response(&mut self) -> Result<(RequestId, Response)> {
-        let length = self.stream.read_u32::<NetworkEndian>()?;
-        let mut stream = io::Read::take(&mut self.stream, length as u64);
-
-        let typ = stream.read_u8()?;
-        let request_id = stream.read_u32::<NetworkEndian>()?;
-
-        let response = match typ {
-            SSH_FXP_STATUS => {
-                let code = stream.read_u32::<NetworkEndian>()?;
-                let message = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
-                let language_tag = read_packet_string(&mut stream)? //
-                    .and_then(|msg| {
-                        if msg.is_empty() {
-                            None
-                        } else {
-                            Some(msg)
-                        }
-                    });
-
-                Response::Status {
-                    code,
-                    message,
-                    language_tag,
+                    Response::Status {
+                        code,
+                        message,
+                        language_tag,
+                    }
                 }
+
+                SSH_FXP_HANDLE => {
+                    let handle =
+                        read_packet_string(&mut stream)?.ok_or_else(|| Error::Protocol {
+                            msg: "missing handle string".into(),
+                        })?;
+                    Response::Handle(FileHandle(handle))
+                }
+
+                SSH_FXP_DATA => {
+                    let data = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
+                    Response::Data(data.into_vec())
+                }
+
+                SSH_FXP_ATTRS => {
+                    let flags = stream.read_u32::<NetworkEndian>()?;
+                    let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
+                        Some(stream.read_u64::<NetworkEndian>()?)
+                    } else {
+                        None
+                    };
+                    let (uid, gid) = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+                        let uid = stream.read_u32::<NetworkEndian>()?;
+                        let gid = stream.read_u32::<NetworkEndian>()?;
+                        (Some(uid), Some(gid))
+                    } else {
+                        (None, None)
+                    };
+                    let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+                        Some(stream.read_u32::<NetworkEndian>()?)
+                    } else {
+                        None
+                    };
+                    let (atime, mtime) = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+                        let atime = stream.read_u32::<NetworkEndian>()?;
+                        let mtime = stream.read_u32::<NetworkEndian>()?;
+                        (Some(atime), Some(mtime))
+                    } else {
+                        (None, None)
+                    };
+
+                    // TODO: parse extended data
+                    let mut data = vec![];
+                    stream.read_to_end(&mut data)?;
+                    drop(data);
+
+                    Response::Attrs(FileAttr {
+                        size,
+                        uid,
+                        gid,
+                        permissions,
+                        atime,
+                        mtime,
+                    })
+                }
+
+                typ => {
+                    let mut data = vec![];
+                    stream.read_to_end(&mut data)?;
+                    Response::Unknown { typ, data }
+                }
+            };
+
+            debug_assert_eq!(stream.limit(), 0);
+
+            if response_id == request_id {
+                return Ok(response);
             }
 
-            SSH_FXP_HANDLE => {
-                let handle = read_packet_string(&mut stream)?.ok_or_else(|| Error::Protocol {
-                    msg: "missing handle string".into(),
-                })?;
-                Response::Handle(FileHandle(handle))
-            }
-
-            SSH_FXP_DATA => {
-                let data = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
-                Response::Data(data.into_vec())
-            }
-
-            SSH_FXP_ATTRS => {
-                let flags = stream.read_u32::<NetworkEndian>()?;
-                let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
-                    Some(stream.read_u64::<NetworkEndian>()?)
-                } else {
-                    None
-                };
-                let (uid, gid) = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
-                    let uid = stream.read_u32::<NetworkEndian>()?;
-                    let gid = stream.read_u32::<NetworkEndian>()?;
-                    (Some(uid), Some(gid))
-                } else {
-                    (None, None)
-                };
-                let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
-                    Some(stream.read_u32::<NetworkEndian>()?)
-                } else {
-                    None
-                };
-                let (atime, mtime) = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
-                    let atime = stream.read_u32::<NetworkEndian>()?;
-                    let mtime = stream.read_u32::<NetworkEndian>()?;
-                    (Some(atime), Some(mtime))
-                } else {
-                    (None, None)
-                };
-
-                // TODO: parse extended data
-                let mut data = vec![];
-                stream.read_to_end(&mut data)?;
-                drop(data);
-
-                Response::Attrs(FileAttr {
-                    size,
-                    uid,
-                    gid,
-                    permissions,
-                    atime,
-                    mtime,
-                })
-            }
-
-            typ => {
-                let mut data = vec![];
-                stream.read_to_end(&mut data)?;
-                Response::Unknown { typ, data }
-            }
-        };
-
-        debug_assert_eq!(stream.limit(), 0);
-
-        Ok((request_id, response))
+            self.pending_responses.insert(response_id, response);
+        }
     }
 }
 
 /// The kind of response values received from the server.
 #[derive(Debug)]
-#[non_exhaustive]
-pub enum Response {
+enum Response {
     /// The operation is failed.
     Status {
         code: u32,
