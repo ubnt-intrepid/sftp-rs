@@ -1,5 +1,9 @@
-use anyhow::{ensure, Context as _, Result};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use anyhow::{Context as _, Result};
+use std::{
+    io::{self, IoSlice, IoSliceMut},
+    net::{IpAddr, SocketAddr},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -16,30 +20,12 @@ fn main() -> Result<()> {
     tracing::debug!(?addr);
     tracing::debug!(?username);
 
-    let mut ssh2 = ssh2::Session::new().context("failed to create ssh2 session")?;
-
-    let stream = TcpStream::connect(&addr).context("failed to establish TCP connection")?;
-    ssh2.set_tcp_stream(stream);
-
-    ssh2.handshake()
-        .context("errored on performing SSH handshake")?;
-
-    authenticate(&ssh2, &username).context("failed to authenticate SSH session")?;
-    ensure!(ssh2.authenticated(), "SSH session is not authenticated");
-
-    let mut channel = ssh2
-        .channel_session()
-        .context("failed to establish a session-based channel on SSH connection")?;
-
-    channel
-        .subsystem("sftp")
-        .context("SFTP subsystem is not supported")?;
+    let conn = establish_connection(&addr, &username)?;
 
     tracing::debug!("start SFTP");
 
     // TODO: communicate SFTP
-
-    let mut sftp = sftp::Session::init(channel).context("failed to init SFTP")?;
+    let mut sftp = sftp::Session::init(conn).context("failed to init SFTP")?;
     tracing::debug!("extensions: {:?}", sftp.extensions());
 
     tracing::debug!("stat(\".\")");
@@ -121,23 +107,59 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn authenticate(ssh2: &ssh2::Session, username: &str) -> Result<()> {
-    let mut agent = ssh2.agent().context("failed to init SSH agent handle")?;
-    agent.connect().context("failed to connect to SSH agent")?;
+struct Connection {
+    _child: Child,
+    reader: ChildStdout,
+    writer: ChildStdin,
+}
 
-    agent
-        .list_identities()
-        .context("failed to fetch identities from SSH agent")?;
-    let identities = agent
-        .identities()
-        .context("failed to get identities from SSH agent")?;
-    ensure!(!identities.is_empty(), "public keys is empty");
-
-    for identity in identities {
-        if let Err(..) = agent.userauth(username, &identity) {
-            continue;
-        }
+impl io::Read for Connection {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf)
     }
 
-    Ok(())
+    #[inline]
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        self.reader.read_vectored(bufs)
+    }
+}
+
+impl io::Write for Connection {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.writer.write_vectored(bufs)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+fn establish_connection(addr: &SocketAddr, username: &str) -> Result<Connection> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-p")
+        .arg(addr.port().to_string())
+        .arg(format!("{}@{}", username, addr.ip().to_string()))
+        .args(&["-s", "sftp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    tracing::debug!("spawn {:?}", cmd);
+    let mut child = cmd.spawn().context("failed to spawn ssh")?;
+
+    let reader = child.stdout.take().expect("missing stdout pipe");
+    let writer = child.stdin.take().expect("missing stdin pipe");
+
+    Ok(Connection {
+        _child: child,
+        reader,
+        writer,
+    })
 }
