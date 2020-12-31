@@ -83,16 +83,49 @@ pub enum Error {
     Protocol { msg: Cow<'static, str> },
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("from remote server")]
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug)]
+pub struct FileHandle(OsString);
+
+// described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
+#[derive(Debug)]
 #[non_exhaustive]
-pub struct RemoteError {
-    pub code: u32,
-    pub message: OsString,
-    pub language_tag: Option<OsString>,
+pub struct FileAttr {
+    pub size: Option<u64>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub permissions: Option<u32>,
+    pub atime: Option<u32>,
+    pub mtime: Option<u32>,
+    pub extended: Vec<(OsString, OsString)>,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DirEntry {
+    pub filename: OsString,
+    pub longname: OsString,
+    pub attrs: FileAttr,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("from remote server")]
+pub struct RemoteError(RemoteStatus);
+
+impl RemoteError {
+    pub fn code(&self) -> u32 {
+        self.0.code
+    }
+
+    pub fn message(&self) -> &OsStr {
+        &self.0.message
+    }
+
+    pub fn language_tag(&self) -> &OsStr {
+        &self.0.language_tag
+    }
+}
 
 /// SFTP session.
 #[derive(Debug)]
@@ -136,12 +169,15 @@ where
                 });
             }
 
-            while let Some(name) = read_packet_string(&mut io)? {
-                let value = read_packet_string(&mut io)? //
-                    .ok_or_else(|| Error::Protocol {
-                        msg: "missing extension value".into(),
-                    })?;
-                extensions.push((name, value));
+            loop {
+                match read_packet_string(&mut io) {
+                    Ok(name) => {
+                        let value = read_packet_string(&mut io)?;
+                        extensions.push((name, value));
+                    }
+                    Err(Error::Io(ref err)) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -186,16 +222,7 @@ where
 
         match self.receive_response(request_id)? {
             Response::Attrs(attrs) => Ok(Ok(attrs)),
-            Response::Status {
-                code,
-                message,
-                language_tag,
-                ..
-            } => Ok(Err(RemoteError {
-                code,
-                message,
-                language_tag,
-            })),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
             }),
@@ -224,16 +251,7 @@ where
 
         match self.receive_response(request_id)? {
             Response::Handle(handle) => Ok(Ok(handle)),
-            Response::Status {
-                code,
-                message,
-                language_tag,
-                ..
-            } => Ok(Err(RemoteError {
-                code,
-                message,
-                language_tag,
-            })),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
             }),
@@ -263,16 +281,7 @@ where
 
         match self.receive_response(request_id)? {
             Response::Data(data) => Ok(Ok(data)),
-            Response::Status {
-                code,
-                message,
-                language_tag,
-                ..
-            } => Ok(Err(RemoteError {
-                code,
-                message,
-                language_tag,
-            })),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
             }),
@@ -302,19 +311,8 @@ where
         )?;
 
         match self.receive_response(request_id)? {
-            Response::Status {
-                code: SSH_FX_OK, ..
-            } => Ok(Ok(())),
-            Response::Status {
-                code,
-                message,
-                language_tag,
-                ..
-            } => Ok(Err(RemoteError {
-                code,
-                message,
-                language_tag,
-            })),
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(Ok(())),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
             }),
@@ -336,19 +334,56 @@ where
         )?;
 
         match self.receive_response(request_id)? {
-            Response::Status {
-                code: SSH_FX_OK, ..
-            } => Ok(Ok(())),
-            Response::Status {
-                code,
-                message,
-                language_tag,
-                ..
-            } => Ok(Err(RemoteError {
-                code,
-                message,
-                language_tag,
-            })),
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(Ok(())),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to open a directory for reading.
+    pub fn opendir(&mut self, path: impl AsRef<OsStr>) -> Result<Result<FileHandle, RemoteError>> {
+        let path = path.as_ref();
+        let path_len = path.len() as u32;
+
+        let request_id = self.send_request(
+            SSH_FXP_OPENDIR,
+            4 + path_len, // len(u32) + path
+            |stream| {
+                stream.write_u32::<NetworkEndian>(path_len)?;
+                stream.write_all(path.as_bytes())?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Handle(handle) => Ok(Ok(handle)),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to open a directory for reading.
+    pub fn readdir(&mut self, handle: &FileHandle) -> Result<Result<Vec<DirEntry>, RemoteError>> {
+        let FileHandle(handle) = handle;
+        let handle_len = handle.len() as u32;
+
+        let request_id = self.send_request(
+            SSH_FXP_READDIR,
+            4 + handle_len, // len(u32) + path
+            |stream| {
+                stream.write_u32::<NetworkEndian>(handle_len)?;
+                stream.write_all(handle.as_bytes())?;
+                Ok(())
+            },
+        )?;
+
+        match self.receive_response(request_id)? {
+            Response::Name(entries) => Ok(Ok(entries)),
+            Response::Status(st) => Ok(Err(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
             }),
@@ -388,76 +423,44 @@ where
             let response = match typ {
                 SSH_FXP_STATUS => {
                     let code = stream.read_u32::<NetworkEndian>()?;
-                    let message = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
-                    let language_tag = read_packet_string(&mut stream)? //
-                        .and_then(|msg| {
-                            if msg.is_empty() {
-                                None
-                            } else {
-                                Some(msg)
-                            }
-                        });
-
-                    Response::Status {
+                    let message = read_packet_string(&mut stream)?;
+                    let language_tag = read_packet_string(&mut stream)?;
+                    Response::Status(RemoteStatus {
                         code,
                         message,
                         language_tag,
-                    }
+                    })
                 }
 
                 SSH_FXP_HANDLE => {
-                    let handle =
-                        read_packet_string(&mut stream)?.ok_or_else(|| Error::Protocol {
-                            msg: "missing handle string".into(),
-                        })?;
+                    let handle = read_packet_string(&mut stream)?;
                     Response::Handle(FileHandle(handle))
                 }
 
                 SSH_FXP_DATA => {
-                    let data = read_packet_string(&mut stream)?.unwrap_or_else(OsString::new);
+                    let data = read_packet_string(&mut stream)?;
                     Response::Data(data.into_vec())
                 }
 
                 SSH_FXP_ATTRS => {
-                    let flags = stream.read_u32::<NetworkEndian>()?;
-                    let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
-                        Some(stream.read_u64::<NetworkEndian>()?)
-                    } else {
-                        None
-                    };
-                    let (uid, gid) = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
-                        let uid = stream.read_u32::<NetworkEndian>()?;
-                        let gid = stream.read_u32::<NetworkEndian>()?;
-                        (Some(uid), Some(gid))
-                    } else {
-                        (None, None)
-                    };
-                    let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
-                        Some(stream.read_u32::<NetworkEndian>()?)
-                    } else {
-                        None
-                    };
-                    let (atime, mtime) = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
-                        let atime = stream.read_u32::<NetworkEndian>()?;
-                        let mtime = stream.read_u32::<NetworkEndian>()?;
-                        (Some(atime), Some(mtime))
-                    } else {
-                        (None, None)
-                    };
+                    let attrs = read_file_attr(&mut stream)?;
+                    Response::Attrs(attrs)
+                }
 
-                    // TODO: parse extended data
-                    let mut data = vec![];
-                    stream.read_to_end(&mut data)?;
-                    drop(data);
-
-                    Response::Attrs(FileAttr {
-                        size,
-                        uid,
-                        gid,
-                        permissions,
-                        atime,
-                        mtime,
-                    })
+                SSH_FXP_NAME => {
+                    let count = stream.read_u32::<NetworkEndian>()?;
+                    let mut entries = Vec::with_capacity(count as usize);
+                    for _ in 0..count {
+                        let filename = read_packet_string(&mut stream)?;
+                        let longname = read_packet_string(&mut stream)?;
+                        let attrs = read_file_attr(&mut stream)?;
+                        entries.push(DirEntry {
+                            filename,
+                            longname,
+                            attrs,
+                        });
+                    }
+                    Response::Name(entries)
                 }
 
                 typ => {
@@ -482,11 +485,7 @@ where
 #[derive(Debug)]
 enum Response {
     /// The operation is failed.
-    Status {
-        code: u32,
-        message: OsString,
-        language_tag: Option<OsString>,
-    },
+    Status(RemoteStatus),
 
     /// An opened file handle.
     Handle(FileHandle),
@@ -497,38 +496,85 @@ enum Response {
     /// Retrieved attribute values.
     Attrs(FileAttr),
 
+    /// Directory entries.
+    Name(Vec<DirEntry>),
+
     /// The response type is unknown or currently not supported.
     Unknown { typ: u8, data: Vec<u8> },
 }
 
 #[derive(Debug)]
-pub struct FileHandle(OsString);
-
-// described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct FileAttr {
-    pub size: Option<u64>,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
-    pub permissions: Option<u32>,
-    pub atime: Option<u32>,
-    pub mtime: Option<u32>,
+struct RemoteStatus {
+    code: u32,
+    message: OsString,
+    language_tag: OsString,
 }
 
-fn read_packet_string<R>(mut reader: R) -> Result<Option<OsString>>
+fn read_packet_string<R>(mut r: R) -> Result<OsString>
 where
     R: io::Read,
 {
-    let len = match reader.read_u32::<NetworkEndian>() {
-        Ok(n) => n,
-        Err(ref err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
+    let len = r.read_u32::<NetworkEndian>()?;
 
     let mut buf = vec![0u8; len as usize];
-    reader.read_exact(&mut buf[..])?;
+    r.read_exact(&mut buf[..])?;
     let s = OsString::from_vec(buf);
 
-    Ok(Some(s))
+    Ok(s)
+}
+
+fn read_file_attr<R>(mut r: R) -> Result<FileAttr>
+where
+    R: io::Read,
+{
+    let flags = r.read_u32::<NetworkEndian>()?;
+
+    let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
+        Some(r.read_u64::<NetworkEndian>()?)
+    } else {
+        None
+    };
+
+    let (uid, gid) = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+        let uid = r.read_u32::<NetworkEndian>()?;
+        let gid = r.read_u32::<NetworkEndian>()?;
+        (Some(uid), Some(gid))
+    } else {
+        (None, None)
+    };
+
+    let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+        Some(r.read_u32::<NetworkEndian>()?)
+    } else {
+        None
+    };
+
+    let (atime, mtime) = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+        let atime = r.read_u32::<NetworkEndian>()?;
+        let mtime = r.read_u32::<NetworkEndian>()?;
+        (Some(atime), Some(mtime))
+    } else {
+        (None, None)
+    };
+
+    let mut extended = vec![];
+
+    if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
+        let count = r.read_u32::<NetworkEndian>()?;
+        for _ in 0..count {
+            let ex_type = read_packet_string(&mut r)?;
+            let ex_data = read_packet_string(&mut r)?;
+            extended.push((ex_type, ex_data));
+        }
+    }
+
+    Ok(FileAttr {
+        size,
+        uid,
+        gid,
+        permissions,
+        atime,
+        mtime,
+        extended,
+    })
 }

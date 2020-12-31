@@ -50,20 +50,15 @@ fn main() -> Result<()> {
         Err(err) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
-                err.code,
-                err.message
+                err.code(),
+                err.message()
             );
             return Ok(());
         }
     }
 
-    tracing::debug!("open(\"test.txt\")");
-    let handle = match {
-        sftp.open(
-            "test.txt",
-            sftp::consts::SSH_FXF_WRITE | sftp::consts::SSH_FXF_TRUNC,
-        )?
-    } {
+    tracing::debug!("opendir(\".\")");
+    let handle = match sftp.opendir(".")? {
         Ok(handle) => {
             tracing::debug!("--> ok(handle = {:?})", handle);
             handle
@@ -71,23 +66,23 @@ fn main() -> Result<()> {
         Err(err) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
-                err.code,
-                err.message
+                err.code(),
+                err.message()
             );
             return Ok(());
         }
     };
 
-    tracing::debug!("write(..)");
-    match sftp.write(&handle, 0, b"Hello, from SFTP!\n")? {
-        Ok(()) => {
-            tracing::debug!("--> ok");
+    tracing::debug!("readdir(..)");
+    match sftp.readdir(&handle)? {
+        Ok(entries) => {
+            tracing::debug!("--> ok(entries = {:#?})", entries);
         }
         Err(err) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
-                err.code,
-                err.message
+                err.code(),
+                err.message()
             );
             return Ok(());
         }
@@ -101,8 +96,8 @@ fn main() -> Result<()> {
         Err(err) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
-                err.code,
-                err.message
+                err.code(),
+                err.message()
             );
             return Ok(());
         }
