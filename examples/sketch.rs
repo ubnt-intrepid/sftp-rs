@@ -1,6 +1,5 @@
 use anyhow::{Context as _, Result};
 use std::{
-    io::{self, IoSlice, IoSliceMut},
     net::{IpAddr, SocketAddr},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
@@ -20,20 +19,20 @@ fn main() -> Result<()> {
     tracing::debug!(?addr);
     tracing::debug!(?username);
 
-    let conn = establish_connection(&addr, &username)?;
+    let (mut child, r, w) = establish_connection(&addr, &username)?;
 
     tracing::debug!("start SFTP");
 
-    // TODO: communicate SFTP
-    let mut sftp = sftp::Session::init(conn).context("failed to init SFTP")?;
-    tracing::debug!("extensions: {:?}", sftp.extensions());
+    let (sftp, send, recv) = sftp::init(r, w).context("failed to init SFTP session")?;
+    std::thread::spawn(move || tracing::debug_span!("send_request").in_scope(|| send.run()));
+    std::thread::spawn(move || tracing::debug_span!("recv_response").in_scope(|| recv.run()));
 
-    tracing::debug!("stat(\".\")");
-    match sftp.stat(".")? {
+    tracing::debug!(r#"stat(".")"#);
+    match sftp.stat(".") {
         Ok(attrs) => {
             tracing::debug!("--> {:?}", attrs);
         }
-        Err(err) => {
+        Err(sftp::Error::Remote(err)) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
                 err.code(),
@@ -41,14 +40,15 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Err(err) => return Err(err.into()),
     }
 
-    tracing::debug!("realpath(\".\")");
-    match sftp.realpath(".")? {
+    tracing::debug!(r#"realpath(".")"#);
+    match sftp.realpath(".") {
         Ok(path) => {
             tracing::debug!("--> ok(path = {:?})", path);
         }
-        Err(err) => {
+        Err(sftp::Error::Remote(err)) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
                 err.code(),
@@ -56,15 +56,31 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Err(err) => return Err(err.into()),
     }
 
-    tracing::debug!("opendir(\".\")");
-    let handle = match sftp.opendir(".")? {
-        Ok(handle) => {
-            tracing::debug!("--> ok(handle = {:?})", handle);
-            handle
+    tracing::debug!(r#"stat("./foo.txt")"#);
+    match sftp.stat("./foo.txt") {
+        Ok(attrs) => {
+            tracing::debug!("--> {:?}", attrs);
         }
-        Err(err) => {
+        Err(sftp::Error::Remote(err)) => {
+            tracing::debug!(
+                "--> error(code = {}, message = {:?})",
+                err.code(),
+                err.message()
+            );
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    tracing::debug!(r#"opendir(".")"#);
+    let dir = match sftp.opendir(".") {
+        Ok(dir) => {
+            tracing::debug!("--> ok(handle = {:?})", dir);
+            dir
+        }
+        Err(sftp::Error::Remote(err)) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
                 err.code(),
@@ -72,14 +88,15 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Err(err) => return Err(err.into()),
     };
 
-    tracing::debug!("readdir(..)");
-    match sftp.readdir(&handle)? {
+    tracing::debug!(r#"readdir({:?})"#, dir);
+    match sftp.readdir(&dir) {
         Ok(entries) => {
-            tracing::debug!("--> ok(entries = {:#?})", entries);
+            tracing::debug!("--> ok(entries = {:?})", entries);
         }
-        Err(err) => {
+        Err(sftp::Error::Remote(err)) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
                 err.code(),
@@ -87,14 +104,15 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Err(err) => return Err(err.into()),
     }
 
-    tracing::debug!("close()");
-    match sftp.close(&handle)? {
+    tracing::debug!(r#"close({:?})"#, dir);
+    match sftp.close(&dir) {
         Ok(()) => {
             tracing::debug!("--> ok");
         }
-        Err(err) => {
+        Err(sftp::Error::Remote(err)) => {
             tracing::debug!(
                 "--> error(code = {}, message = {:?})",
                 err.code(),
@@ -102,47 +120,19 @@ fn main() -> Result<()> {
             );
             return Ok(());
         }
+        Err(err) => return Err(err.into()),
     };
+
+    child.kill().context("failed to send KILL")?;
+    child.wait()?;
 
     Ok(())
 }
 
-struct Connection {
-    _child: Child,
-    reader: ChildStdout,
-    writer: ChildStdin,
-}
-
-impl io::Read for Connection {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.reader.read(buf)
-    }
-
-    #[inline]
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        self.reader.read_vectored(bufs)
-    }
-}
-
-impl io::Write for Connection {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
-    }
-
-    #[inline]
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.writer.write_vectored(bufs)
-    }
-
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
-fn establish_connection(addr: &SocketAddr, username: &str) -> Result<Connection> {
+fn establish_connection(
+    addr: &SocketAddr,
+    username: &str,
+) -> Result<(Child, ChildStdout, ChildStdin)> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-p")
         .arg(addr.port().to_string())
@@ -157,9 +147,5 @@ fn establish_connection(addr: &SocketAddr, username: &str) -> Result<Connection>
     let reader = child.stdout.take().expect("missing stdout pipe");
     let writer = child.stdin.take().expect("missing stdin pipe");
 
-    Ok(Connection {
-        _child: child,
-        reader,
-        writer,
-    })
+    Ok((child, reader, writer))
 }
