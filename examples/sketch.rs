@@ -1,10 +1,13 @@
 use anyhow::{Context as _, Result};
 use std::{
     net::{IpAddr, SocketAddr},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::Stdio,
 };
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tracing::Instrument as _;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let mut args = pico_args::Arguments::from_env();
@@ -23,12 +26,14 @@ fn main() -> Result<()> {
 
     tracing::debug!("start SFTP");
 
-    let (sftp, send, recv) = sftp::init(r, w, vec![]).context("failed to init SFTP session")?;
-    std::thread::spawn(move || tracing::debug_span!("send_request").in_scope(|| send.run()));
-    std::thread::spawn(move || tracing::debug_span!("recv_response").in_scope(|| recv.run()));
+    let (sftp, send, recv) = sftp::init(r, w, vec![])
+        .await
+        .context("failed to init SFTP session")?;
+    tokio::spawn(send.run().instrument(tracing::debug_span!("send_request")));
+    tokio::spawn(recv.run().instrument(tracing::debug_span!("recv_response")));
 
     tracing::debug!(r#"stat(".")"#);
-    match sftp.stat(".") {
+    match sftp.stat(".").await {
         Ok(attrs) => {
             tracing::debug!("--> {:?}", attrs);
         }
@@ -44,7 +49,7 @@ fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"realpath(".")"#);
-    match sftp.realpath(".") {
+    match sftp.realpath(".").await {
         Ok(path) => {
             tracing::debug!("--> ok(path = {:?})", path);
         }
@@ -60,7 +65,7 @@ fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"stat("./foo.txt")"#);
-    match sftp.stat("./foo.txt") {
+    match sftp.stat("./foo.txt").await {
         Ok(attrs) => {
             tracing::debug!("--> {:?}", attrs);
         }
@@ -75,7 +80,7 @@ fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"opendir(".")"#);
-    let dir = match sftp.opendir(".") {
+    let dir = match sftp.opendir(".").await {
         Ok(dir) => {
             tracing::debug!("--> ok(handle = {:?})", dir);
             dir
@@ -92,7 +97,7 @@ fn main() -> Result<()> {
     };
 
     tracing::debug!(r#"readdir({:?})"#, dir);
-    match sftp.readdir(&dir) {
+    match sftp.readdir(&dir).await {
         Ok(entries) => {
             tracing::debug!("--> ok(entries = {:?})", entries);
         }
@@ -108,7 +113,7 @@ fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"close({:?})"#, dir);
-    match sftp.close(&dir) {
+    match sftp.close(&dir).await {
         Ok(()) => {
             tracing::debug!("--> ok");
         }
@@ -123,7 +128,10 @@ fn main() -> Result<()> {
         Err(err) => return Err(err.into()),
     };
 
-    match sftp.extended("statvfs@openssh.com", &[0, 0, 0, 1, b'.'] /* = "." */) {
+    match sftp
+        .extended("statvfs@openssh.com", &[0, 0, 0, 1, b'.'] /* = "." */)
+        .await
+    {
         Ok(data) => {
             tracing::debug!("--> ok(data = {:?})", data);
         }
@@ -138,8 +146,8 @@ fn main() -> Result<()> {
         Err(err) => return Err(err.into()),
     }
 
-    child.kill().context("failed to send KILL")?;
-    child.wait()?;
+    child.kill().await.context("failed to send KILL")?;
+    child.wait().await?;
 
     Ok(())
 }
