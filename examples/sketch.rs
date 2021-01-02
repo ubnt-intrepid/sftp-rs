@@ -23,7 +23,7 @@ fn main() -> Result<()> {
 
     tracing::debug!("start SFTP");
 
-    let (sftp, send, recv) = sftp::init(r, w).context("failed to init SFTP session")?;
+    let (sftp, send, recv) = sftp::init(r, w, vec![]).context("failed to init SFTP session")?;
     std::thread::spawn(move || tracing::debug_span!("send_request").in_scope(|| send.run()));
     std::thread::spawn(move || tracing::debug_span!("recv_response").in_scope(|| recv.run()));
 

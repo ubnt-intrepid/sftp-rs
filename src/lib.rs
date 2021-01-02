@@ -835,8 +835,8 @@ where
         let response = match typ {
             SSH_FXP_STATUS => {
                 let code = reader.read_u32::<NetworkEndian>()?;
-                let message = read_packet_string(&mut reader)?;
-                let language_tag = read_packet_string(&mut reader)?;
+                let message = read_string(&mut reader)?;
+                let language_tag = read_string(&mut reader)?;
                 Response::Status(RemoteStatus {
                     code,
                     message,
@@ -845,12 +845,12 @@ where
             }
 
             SSH_FXP_HANDLE => {
-                let handle = read_packet_string(&mut reader)?;
+                let handle = read_string(&mut reader)?;
                 Response::Handle(FileHandle(handle))
             }
 
             SSH_FXP_DATA => {
-                let data = read_packet_string(&mut reader)?;
+                let data = read_string(&mut reader)?;
                 Response::Data(data.into_vec())
             }
 
@@ -863,8 +863,8 @@ where
                 let count = reader.read_u32::<NetworkEndian>()?;
                 let mut entries = Vec::with_capacity(count as usize);
                 for _ in 0..count {
-                    let filename = read_packet_string(&mut reader)?;
-                    let longname = read_packet_string(&mut reader)?;
+                    let filename = read_string(&mut reader)?;
+                    let longname = read_string(&mut reader)?;
                     let attrs = read_file_attr(&mut reader)?;
                     entries.push(DirEntry {
                         filename,
@@ -894,7 +894,7 @@ where
     }
 }
 
-fn read_packet_string<R>(mut r: R) -> Result<OsString>
+fn read_string<R>(mut r: R) -> Result<OsString>
 where
     R: io::Read,
 {
@@ -946,8 +946,8 @@ where
     if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
         let count = r.read_u32::<NetworkEndian>()?;
         for _ in 0..count {
-            let ex_type = read_packet_string(&mut r)?;
-            let ex_data = read_packet_string(&mut r)?;
+            let ex_type = read_string(&mut r)?;
+            let ex_data = read_string(&mut r)?;
             extended.push((ex_type, ex_data));
         }
     }
@@ -1073,7 +1073,11 @@ struct RemoteStatus {
 /// the settings of SFTP protocol to use.  When the initialization process is
 /// successed, it returns a handle to send subsequent SFTP requests from the
 /// client and objects to drive the underlying communication with the server.
-pub fn init<R, W>(mut r: R, mut w: W) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
+pub fn init<R, W>(
+    mut r: R,
+    mut w: W,
+    extensions: Vec<(OsString, OsString)>,
+) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
 where
     R: io::Read,
     W: io::Write,
@@ -1082,7 +1086,10 @@ where
     w.write_u32::<NetworkEndian>(5)?; // length = type(= 1byte) + version(= 4byte)
     w.write_u8(SSH_FXP_INIT)?;
     w.write_u32::<NetworkEndian>(SFTP_PROTOCOL_VERSION)?;
-    // TODO: send extension data
+    for (name, data) in extensions {
+        write_string(&mut w, name.as_bytes())?;
+        write_string(&mut w, data.as_bytes())?;
+    }
     w.flush()?;
 
     // receive SSH_FXP_VERSION packet.
@@ -1106,10 +1113,10 @@ where
         }
 
         loop {
-            match read_packet_string(&mut r) {
+            match read_string(&mut r) {
                 Ok(name) => {
-                    let value = read_packet_string(&mut r)?;
-                    extensions.push((name, value));
+                    let data = read_string(&mut r)?;
+                    extensions.push((name, data));
                 }
                 Err(Error::Transport(ref err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
                     break
