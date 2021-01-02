@@ -97,16 +97,32 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct FileAttr {
     pub size: Option<u64>,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
+    pub uid_gid: Option<(u32, u32)>,
     pub permissions: Option<u32>,
-    pub atime: Option<u32>,
-    pub mtime: Option<u32>,
+    pub ac_mod_time: Option<(u32, u32)>,
     pub extended: Vec<(OsString, OsString)>,
+}
+
+impl FileAttr {
+    pub fn uid(&self) -> Option<u32> {
+        self.uid_gid.map(|(uid, _)| uid)
+    }
+
+    pub fn gid(&self) -> Option<u32> {
+        self.uid_gid.map(|(_, gid)| gid)
+    }
+
+    pub fn atime(&self) -> Option<u32> {
+        self.ac_mod_time.map(|(atime, _)| atime)
+    }
+
+    pub fn mtime(&self) -> Option<u32> {
+        self.ac_mod_time.map(|(_, mtime)| mtime)
+    }
 }
 
 #[derive(Debug)]
@@ -166,42 +182,17 @@ impl Session {
         Ok(pending)
     }
 
-    /// Request to retrieve attribute values for a named file.
-    #[inline]
-    pub fn stat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr> {
-        let pending = self.send_request(Request::Stat {
-            filename: filename.as_ref().to_owned(),
-        })?;
-
-        match pending.wait() {
-            Response::Attrs(attrs) => Ok(attrs),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
-        }
-    }
-
-    /// Request to retrieve attribute values for a named file, without following symbolic links.
-    #[inline]
-    pub fn lstat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr> {
-        let pending = self.send_request(Request::LStat {
-            filename: filename.as_ref().to_owned(),
-        })?;
-        match pending.wait() {
-            Response::Attrs(attrs) => Ok(attrs),
-            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
-            _ => Err(Error::Protocol {
-                msg: "incorrect response type".into(),
-            }),
-        }
-    }
-
     /// Request to open a file.
-    pub fn open(&self, filename: impl AsRef<OsStr>, pflags: u32) -> Result<FileHandle> {
+    pub fn open(
+        &self,
+        filename: impl AsRef<OsStr>,
+        pflags: u32,
+        attrs: FileAttr,
+    ) -> Result<FileHandle> {
         let pending = self.send_request(Request::Open {
             filename: filename.as_ref().to_owned(),
             pflags,
+            attrs,
         })?;
         match pending.wait() {
             Response::Handle(handle) => Ok(handle),
@@ -258,10 +249,69 @@ impl Session {
         }
     }
 
+    /// Request to retrieve attribute values for a named file, without following symbolic links.
+    #[inline]
+    pub fn lstat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr> {
+        let pending = self.send_request(Request::LStat {
+            path: filename.as_ref().to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Attrs(attrs) => Ok(attrs),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to retrieve attribute values for a named file.
+    #[inline]
+    pub fn fstat(&self, handle: &FileHandle) -> Result<FileAttr> {
+        let pending = self.send_request(Request::FStat {
+            handle: handle.0.clone(),
+        })?;
+
+        match pending.wait() {
+            Response::Attrs(attrs) => Ok(attrs),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn setstat(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<()> {
+        let pending = self.send_request(Request::SetStat {
+            path: path.as_ref().to_owned(),
+            attrs,
+        })?;
+        match pending.wait() {
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn fsetstat(&self, handle: &FileHandle, attrs: FileAttr) -> Result<()> {
+        let pending = self.send_request(Request::FSetStat {
+            handle: handle.0.clone(),
+            attrs,
+        })?;
+        match pending.wait() {
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
     /// Request to open a directory for reading.
     pub fn opendir(&self, path: impl AsRef<OsStr>) -> Result<FileHandle> {
         let pending = self.send_request(Request::Opendir {
-            dirname: path.as_ref().to_owned(),
+            path: path.as_ref().to_owned(),
         })?;
         match pending.wait() {
             Response::Handle(handle) => Ok(handle),
@@ -286,13 +336,129 @@ impl Session {
         }
     }
 
-    pub fn realpath(&self, filename: impl AsRef<OsStr>) -> Result<Result<OsString, RemoteError>> {
-        let pending = self.send_request(Request::Realpath {
+    pub fn remove(&self, filename: impl AsRef<OsStr>) -> Result<()> {
+        let pending = self.send_request(Request::Remove {
             filename: filename.as_ref().to_owned(),
         })?;
         match pending.wait() {
-            Response::Name(mut entries) => Ok(Ok(entries.remove(0).filename)),
-            Response::Status(st) => Ok(Err(RemoteError(st))),
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn mkdir(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<()> {
+        let pending = self.send_request(Request::Mkdir {
+            path: path.as_ref().to_owned(),
+            attrs,
+        })?;
+        match pending.wait() {
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn rmdir(&self, path: impl AsRef<OsStr>) -> Result<()> {
+        let pending = self.send_request(Request::Rmdir {
+            path: path.as_ref().to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    ///
+    pub fn realpath(&self, filename: impl AsRef<OsStr>) -> Result<OsString> {
+        let pending = self.send_request(Request::Realpath {
+            path: filename.as_ref().to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Name(mut entries) => Ok(entries.remove(0).filename),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    /// Request to retrieve attribute values for a named file.
+    #[inline]
+    pub fn stat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr> {
+        let pending = self.send_request(Request::Stat {
+            path: filename.as_ref().to_owned(),
+        })?;
+
+        match pending.wait() {
+            Response::Attrs(attrs) => Ok(attrs),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn rename(&self, oldpath: impl AsRef<OsStr>, newpath: impl AsRef<OsStr>) -> Result<()> {
+        let pending = self.send_request(Request::Rename {
+            oldpath: oldpath.as_ref().to_owned(),
+            newpath: newpath.as_ref().to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn readlink(&self, path: impl AsRef<OsStr>) -> Result<OsString> {
+        let pending = self.send_request(Request::Readlink {
+            path: path.as_ref().to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Name(mut entries) => Ok(entries.remove(0).filename),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn symlink(
+        &self,
+        linkpath: impl AsRef<OsStr>,
+        targetpath: impl AsRef<OsStr>,
+    ) -> Result<()> {
+        let pending = self.send_request(Request::Symlink {
+            linkpath: linkpath.as_ref().to_owned(),
+            targetpath: targetpath.as_ref().to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
+            Response::Status(st) => Err(Error::Remote(RemoteError(st))),
+            _ => Err(Error::Protocol {
+                msg: "incorrect response type".into(),
+            }),
+        }
+    }
+
+    pub fn extended(&self, request: impl AsRef<OsStr>, data: &[u8]) -> Result<Vec<u8>> {
+        let pending = self.send_request(Request::Extended {
+            request: request.as_ref().to_owned(),
+            data: data.to_owned(),
+        })?;
+        match pending.wait() {
+            Response::Extended(data) => Ok(data),
+            Response::Status(st) if st.code != SSH_FX_OK => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
             }),
@@ -352,76 +518,194 @@ where
 {
     pub fn run(mut self) -> Result<()> {
         while let Ok((id, req)) = self.incoming_requests.recv() {
-            match &req {
-                Request::Stat { filename: s }
-                | Request::LStat { filename: s }
-                | Request::Close { handle: s }
-                | Request::Opendir { dirname: s }
-                | Request::Readdir { handle: s }
-                | Request::Realpath { filename: s } => {
-                    let data_len = s.len() as u32 + 4;
-                    self.send_request(id, req.packet_type(), data_len, |w| {
-                        w.write_u32::<NetworkEndian>(s.len() as u32)?;
-                        w.write_all(s.as_bytes())?;
-                        Ok(())
-                    })?
-                }
-
-                Request::Open { filename, pflags } => {
-                    let data_len = 4 + filename.len() as u32 + 4 + 4; // filename_len(4byte) + filename(string) + pflags(u32) + attr_flags(u32);
-
-                    self.send_request(id, SSH_FXP_OPEN, data_len, |w| {
-                        w.write_u32::<NetworkEndian>(filename.len() as u32)?;
-                        w.write_all(filename.as_bytes())?;
-                        w.write_u32::<NetworkEndian>(*pflags)?;
-                        // TODO: write `attrs` fields
-                        w.write_u32::<NetworkEndian>(0u32)?;
-                        Ok(())
-                    })?;
-                }
-
-                Request::Read {
-                    handle,
-                    offset,
-                    len,
-                } => {
-                    // handle_len(u32) + handle(string) + offset(u64) + len(u32)
-                    let data_len = 4 + handle.len() as u32 + 8 + 4;
-
-                    self.send_request(id, SSH_FXP_READ, data_len, |w| {
-                        w.write_u32::<NetworkEndian>(handle.len() as u32)?;
-                        w.write_all(handle.as_bytes())?;
-                        w.write_u64::<NetworkEndian>(*offset)?;
-                        w.write_u32::<NetworkEndian>(*len)?;
-                        Ok(())
-                    })?;
-                }
-
-                Request::Write {
-                    handle,
-                    offset,
-                    data,
-                } => {
-                    // handle_len(u32) + handle(string) + offset(u64) + data_len(u32) + data(string)
-                    let data_len = 4 + handle.len() as u32 + 8 + 4 + data.len() as u32;
-
-                    self.send_request(id, SSH_FXP_WRITE, data_len, |stream| {
-                        stream.write_u32::<NetworkEndian>(handle.len() as u32)?;
-                        stream.write_all(handle.as_bytes())?;
-                        stream.write_u64::<NetworkEndian>(*offset)?;
-                        stream.write_u32::<NetworkEndian>(data.len() as u32)?;
-                        stream.write_all(data)?;
-                        Ok(())
-                    })?;
-                }
-            }
-            self.writer.flush()?;
+            self.send_request(id, req)?;
         }
-
         Ok(())
     }
 
-    fn send_request<F>(&mut self, id: u32, packet_type: u8, data_len: u32, f: F) -> Result<()>
+    fn send_request(&mut self, id: u32, req: Request) -> Result<()> {
+        match req {
+            Request::Open {
+                filename,
+                pflags,
+                attrs,
+            } => {
+                // filename_len(u32) + filename(string) + pflags(u32) + attrs;
+                let data_len = 4 + filename.len() as u32 + 4 + attrs_packet_length(&attrs);
+
+                self.send_request_common(id, SSH_FXP_OPEN, data_len, |w| {
+                    write_string(&mut *w, filename.as_bytes())?;
+                    w.write_u32::<NetworkEndian>(pflags)?;
+                    write_attrs(w, &attrs)?;
+                    Ok(())
+                })?;
+            }
+
+            Request::Close { handle } => {
+                self.send_str_request(id, SSH_FXP_CLOSE, &handle)?;
+            }
+
+            Request::Read {
+                handle,
+                offset,
+                len,
+            } => {
+                // handle_len(u32) + handle(string) + offset(u64) + len(u32)
+                let data_len = 4 + handle.len() as u32 + 8 + 4;
+
+                self.send_request_common(id, SSH_FXP_READ, data_len, |w| {
+                    write_string(&mut *w, handle.as_bytes())?;
+                    w.write_u64::<NetworkEndian>(offset)?;
+                    w.write_u32::<NetworkEndian>(len)?;
+                    Ok(())
+                })?;
+            }
+
+            Request::Write {
+                handle,
+                offset,
+                data,
+            } => {
+                // handle_len(u32) + handle(string) + offset(u64) + data_len(u32) + data(string)
+                let data_len = 4 + handle.len() as u32 + 8 + 4 + data.len() as u32;
+
+                self.send_request_common(id, SSH_FXP_WRITE, data_len, |w| {
+                    write_string(&mut *w, handle.as_bytes())?;
+                    w.write_u64::<NetworkEndian>(offset)?;
+                    write_string(w, &data)?;
+                    Ok(())
+                })?;
+            }
+
+            Request::LStat { path } => {
+                self.send_str_request(id, SSH_FXP_LSTAT, &path)?;
+            }
+
+            Request::FStat { handle } => {
+                self.send_str_request(id, SSH_FXP_FSTAT, &handle)?;
+            }
+
+            Request::SetStat { path, attrs } => {
+                // path_len(u32) + path(string) + attrs
+                let data_len = 4 + path.len() as u32 + attrs_packet_length(&attrs);
+
+                self.send_request_common(id, SSH_FXP_SETSTAT, data_len, |w| {
+                    write_string(&mut *w, path.as_bytes())?;
+                    write_attrs(w, &attrs)?;
+                    Ok(())
+                })?;
+            }
+
+            Request::FSetStat { handle, attrs } => {
+                // handle_len(u32) + path(string) + attrs
+                let data_len = 4 + handle.len() as u32 + attrs_packet_length(&attrs);
+
+                self.send_request_common(id, SSH_FXP_FSETSTAT, data_len, |w| {
+                    write_string(&mut *w, handle.as_bytes())?;
+                    write_attrs(w, &attrs)?;
+                    Ok(())
+                })?;
+            }
+
+            Request::Opendir { path } => {
+                self.send_str_request(id, SSH_FXP_OPENDIR, &path)?;
+            }
+
+            Request::Readdir { handle } => {
+                self.send_str_request(id, SSH_FXP_READDIR, &handle)?;
+            }
+
+            Request::Remove { filename } => {
+                self.send_str_request(id, SSH_FXP_REMOVE, &filename)?;
+            }
+
+            Request::Mkdir { path, attrs } => {
+                // path_len(u32) + path(string) + attrs
+                let data_len = 4 + path.len() as u32 + attrs_packet_length(&attrs);
+
+                self.send_request_common(id, SSH_FXP_MKDIR, data_len, |w| {
+                    write_string(&mut *w, path.as_bytes())?;
+                    write_attrs(w, &attrs)?;
+                    Ok(())
+                })?;
+            }
+
+            Request::Rmdir { path } => {
+                self.send_str_request(id, SSH_FXP_RMDIR, &path)?;
+            }
+
+            Request::Realpath { path } => {
+                self.send_str_request(id, SSH_FXP_REALPATH, &path)?;
+            }
+
+            Request::Stat { path } => {
+                self.send_str_request(id, SSH_FXP_STAT, &path)?;
+            }
+
+            Request::Rename {
+                oldpath: oldname,
+                newpath: newname,
+            } => {
+                // oldname_len(u32) + oldname(string) + newname_len(u32) + newname(string)
+                let data_len = 4 + oldname.len() as u32 + 4 + newname.len() as u32;
+
+                self.send_request_common(id, SSH_FXP_RENAME, data_len, |w| {
+                    write_string(&mut *w, oldname.as_bytes())?;
+                    write_string(&mut *w, newname.as_bytes())?;
+                    Ok(())
+                })?;
+            }
+
+            Request::Readlink { path } => {
+                self.send_str_request(id, SSH_FXP_READLINK, &path)?;
+            }
+
+            Request::Symlink {
+                linkpath,
+                targetpath,
+            } => {
+                // linkpath_len(u32) + linkpath(string) + targetpath_len(u32) + targetpath(string)
+                let data_len = 4 + linkpath.len() as u32 + 4 + targetpath.len() as u32;
+
+                self.send_request_common(id, SSH_FXP_SYMLINK, data_len, |w| {
+                    write_string(&mut *w, linkpath.as_bytes())?;
+                    write_string(&mut *w, targetpath.as_bytes())?;
+                    Ok(())
+                })?;
+            }
+
+            Request::Extended { request, data } => {
+                // request_len(u32) + reqeust(string) + data(opaque)
+                let data_len = 4 + request.len() as u32 + data.len() as u32;
+
+                self.send_request_common(id, SSH_FXP_EXTENDED, data_len, |w| {
+                    write_string(&mut *w, request.as_bytes())?;
+                    w.write_all(&data)?;
+                    Ok(())
+                })?;
+            }
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn send_str_request(&mut self, id: u32, packet_type: u8, s: &OsStr) -> Result<()> {
+        let data_len = s.len() as u32 + 4;
+        self.send_request_common(id, packet_type, data_len, |w| {
+            w.write_u32::<NetworkEndian>(s.len() as u32)?;
+            w.write_all(s.as_bytes())?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn send_request_common<F>(
+        &mut self,
+        id: u32,
+        packet_type: u8,
+        data_len: u32,
+        f: F,
+    ) -> Result<()>
     where
         F: FnOnce(&mut W) -> Result<()>,
     {
@@ -433,10 +717,90 @@ where
 
         f(&mut self.writer)?;
 
-        self.writer.flush()?;
-
         Ok(())
     }
+}
+
+fn write_string<W>(mut w: W, s: &[u8]) -> Result<()>
+where
+    W: io::Write,
+{
+    w.write_u32::<NetworkEndian>(s.len() as u32)?;
+    w.write_all(s)?;
+    Ok(())
+}
+
+fn attrs_packet_length(attrs: &FileAttr) -> u32 {
+    let mut len = 4u32; // flags
+    if attrs.size.is_some() {
+        len += 8; // size(u64)
+    }
+    if attrs.uid_gid.is_some() {
+        len += 8; // uid(u32) + gid(u32)
+    }
+    if attrs.permissions.is_some() {
+        len += 4; // permissions(u32)
+    }
+    if attrs.ac_mod_time.is_some() {
+        len += 8; // atime(u32) + mtime(u32)
+    }
+    if !attrs.extended.is_empty() {
+        len += 4; // extended_count(u32)
+        len += attrs
+            .extended
+            .iter()
+            .map(|(k, v)| {
+                // type_len(u32) + type(string) + data_len(4) + data(string)
+                4 + k.len() as u32 + 4 + v.len() as u32
+            })
+            .sum::<u32>();
+    }
+    len
+}
+
+fn write_attrs<W>(mut w: W, attrs: &FileAttr) -> Result<()>
+where
+    W: io::Write,
+{
+    #[inline(always)]
+    fn flag(b: bool, flag: u32) -> u32 {
+        if b {
+            flag
+        } else {
+            0
+        }
+    }
+
+    let flags = flag(attrs.size.is_some(), SSH_FILEXFER_ATTR_SIZE)
+        | flag(attrs.uid_gid.is_some(), SSH_FILEXFER_ATTR_UIDGID)
+        | flag(attrs.permissions.is_some(), SSH_FILEXFER_ATTR_PERMISSIONS)
+        | flag(attrs.ac_mod_time.is_some(), SSH_FILEXFER_ATTR_ACMODTIME)
+        | flag(!attrs.extended.is_empty(), SSH_FILEXFER_ATTR_EXTENDED);
+
+    w.write_u32::<NetworkEndian>(flags)?;
+    if let Some(size) = attrs.size {
+        w.write_u64::<NetworkEndian>(size)?;
+    }
+    if let Some((uid, gid)) = attrs.uid_gid {
+        w.write_u32::<NetworkEndian>(uid)?;
+        w.write_u32::<NetworkEndian>(gid)?;
+    }
+    if let Some(perm) = attrs.permissions {
+        w.write_u32::<NetworkEndian>(perm)?;
+    }
+    if let Some((atime, mtime)) = attrs.ac_mod_time {
+        w.write_u32::<NetworkEndian>(atime)?;
+        w.write_u32::<NetworkEndian>(mtime)?;
+    }
+    if !attrs.extended.is_empty() {
+        w.write_u32::<NetworkEndian>(attrs.extended.len() as u32)?;
+        for (typ, data) in &attrs.extended {
+            write_string(&mut w, typ.as_bytes())?;
+            write_string(&mut w, data.as_bytes())?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -511,6 +875,12 @@ where
                 Response::Name(entries)
             }
 
+            SSH_FXP_EXTENDED_REPLY => {
+                let mut data = vec![];
+                reader.read_to_end(&mut data)?;
+                Response::Extended(data)
+            }
+
             typ => {
                 let mut data = vec![];
                 reader.read_to_end(&mut data)?;
@@ -522,87 +892,6 @@ where
 
         Ok((id, response))
     }
-}
-
-#[derive(Debug)]
-enum Request {
-    Stat {
-        filename: OsString,
-    },
-    LStat {
-        filename: OsString,
-    },
-    Open {
-        filename: OsString,
-        pflags: u32,
-    },
-    Close {
-        handle: OsString,
-    },
-    Read {
-        handle: OsString,
-        offset: u64,
-        len: u32,
-    },
-    Write {
-        handle: OsString,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    Opendir {
-        dirname: OsString,
-    },
-    Readdir {
-        handle: OsString,
-    },
-    Realpath {
-        filename: OsString,
-    },
-}
-
-impl Request {
-    fn packet_type(&self) -> u8 {
-        match self {
-            Request::Stat { .. } => SSH_FXP_STAT,
-            Request::LStat { .. } => SSH_FXP_LSTAT,
-            Request::Open { .. } => SSH_FXP_OPEN,
-            Request::Close { .. } => SSH_FXP_CLOSE,
-            Request::Read { .. } => SSH_FXP_READ,
-            Request::Write { .. } => SSH_FXP_WRITE,
-            Request::Opendir { .. } => SSH_FXP_OPENDIR,
-            Request::Readdir { .. } => SSH_FXP_READDIR,
-            Request::Realpath { .. } => SSH_FXP_REALPATH,
-        }
-    }
-}
-
-/// The kind of response values received from the server.
-#[derive(Debug)]
-enum Response {
-    /// The operation is failed.
-    Status(RemoteStatus),
-
-    /// An opened file handle.
-    Handle(FileHandle),
-
-    /// Received data.
-    Data(Vec<u8>),
-
-    /// Retrieved attribute values.
-    Attrs(FileAttr),
-
-    /// Directory entries.
-    Name(Vec<DirEntry>),
-
-    /// The response type is unknown or currently not supported.
-    Unknown { typ: u8, data: Vec<u8> },
-}
-
-#[derive(Debug)]
-struct RemoteStatus {
-    code: u32,
-    message: OsString,
-    language_tag: OsString,
 }
 
 fn read_packet_string<R>(mut r: R) -> Result<OsString>
@@ -630,12 +919,12 @@ where
         None
     };
 
-    let (uid, gid) = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+    let uid_gid = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
         let uid = r.read_u32::<NetworkEndian>()?;
         let gid = r.read_u32::<NetworkEndian>()?;
-        (Some(uid), Some(gid))
+        Some((uid, gid))
     } else {
-        (None, None)
+        None
     };
 
     let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
@@ -644,12 +933,12 @@ where
         None
     };
 
-    let (atime, mtime) = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+    let ac_mod_time = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
         let atime = r.read_u32::<NetworkEndian>()?;
         let mtime = r.read_u32::<NetworkEndian>()?;
-        (Some(atime), Some(mtime))
+        Some((atime, mtime))
     } else {
-        (None, None)
+        None
     };
 
     let mut extended = vec![];
@@ -665,13 +954,117 @@ where
 
     Ok(FileAttr {
         size,
-        uid,
-        gid,
+        uid_gid,
         permissions,
-        atime,
-        mtime,
+        ac_mod_time,
         extended,
     })
+}
+
+#[derive(Debug)]
+enum Request {
+    Open {
+        filename: OsString,
+        pflags: u32,
+        attrs: FileAttr,
+    },
+    Close {
+        handle: OsString,
+    },
+    Read {
+        handle: OsString,
+        offset: u64,
+        len: u32,
+    },
+    Write {
+        handle: OsString,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    LStat {
+        path: OsString,
+    },
+    FStat {
+        handle: OsString,
+    },
+    SetStat {
+        path: OsString,
+        attrs: FileAttr,
+    },
+    FSetStat {
+        handle: OsString,
+        attrs: FileAttr,
+    },
+    Opendir {
+        path: OsString,
+    },
+    Readdir {
+        handle: OsString,
+    },
+    Remove {
+        filename: OsString,
+    },
+    Mkdir {
+        path: OsString,
+        attrs: FileAttr,
+    },
+    Rmdir {
+        path: OsString,
+    },
+    Realpath {
+        path: OsString,
+    },
+    Stat {
+        path: OsString,
+    },
+    Rename {
+        oldpath: OsString,
+        newpath: OsString,
+    },
+    Readlink {
+        path: OsString,
+    },
+    Symlink {
+        linkpath: OsString,
+        targetpath: OsString,
+    },
+
+    Extended {
+        request: OsString,
+        data: Vec<u8>,
+    },
+}
+
+/// The kind of response values received from the server.
+#[derive(Debug)]
+enum Response {
+    /// The operation is failed.
+    Status(RemoteStatus),
+
+    /// An opened file handle.
+    Handle(FileHandle),
+
+    /// Received data.
+    Data(Vec<u8>),
+
+    /// Retrieved attribute values.
+    Attrs(FileAttr),
+
+    /// Directory entries.
+    Name(Vec<DirEntry>),
+
+    /// Reply from an vendor-specific extended request.
+    Extended(Vec<u8>),
+
+    /// The response type is unknown or currently not supported.
+    Unknown { typ: u8, data: Vec<u8> },
+}
+
+#[derive(Debug)]
+struct RemoteStatus {
+    code: u32,
+    message: OsString,
+    language_tag: OsString,
 }
 
 /// Start a SFTP session on the provided transport I/O.

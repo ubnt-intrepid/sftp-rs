@@ -123,6 +123,21 @@ fn main() -> Result<()> {
         Err(err) => return Err(err.into()),
     };
 
+    match sftp.extended("statvfs@openssh.com", &[0, 0, 0, 1, b'.'] /* = "." */) {
+        Ok(data) => {
+            tracing::debug!("--> ok(data = {:?})", data);
+        }
+        Err(sftp::Error::Remote(err)) => {
+            tracing::debug!(
+                "--> error(code = {}, message = {:?})",
+                err.code(),
+                err.message()
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    }
+
     child.kill().context("failed to send KILL")?;
     child.wait()?;
 
