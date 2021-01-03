@@ -19,38 +19,53 @@ use tokio::{
 // * https://tools.ietf.org/html/rfc4251
 // * https://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/sftp-server.c?rev=1.120&content-type=text/x-cvsweb-markup
 
+const SFTP_PROTOCOL_VERSION: u32 = 3;
+
+// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-3
+const SSH_FXP_INIT: u8 = 1;
+const SSH_FXP_VERSION: u8 = 2;
+const SSH_FXP_OPEN: u8 = 3;
+const SSH_FXP_CLOSE: u8 = 4;
+const SSH_FXP_READ: u8 = 5;
+const SSH_FXP_WRITE: u8 = 6;
+const SSH_FXP_LSTAT: u8 = 7;
+const SSH_FXP_FSTAT: u8 = 8;
+const SSH_FXP_SETSTAT: u8 = 9;
+const SSH_FXP_FSETSTAT: u8 = 10;
+const SSH_FXP_OPENDIR: u8 = 11;
+const SSH_FXP_READDIR: u8 = 12;
+const SSH_FXP_REMOVE: u8 = 13;
+const SSH_FXP_MKDIR: u8 = 14;
+const SSH_FXP_RMDIR: u8 = 15;
+const SSH_FXP_REALPATH: u8 = 16;
+const SSH_FXP_STAT: u8 = 17;
+const SSH_FXP_RENAME: u8 = 18;
+const SSH_FXP_READLINK: u8 = 19;
+const SSH_FXP_SYMLINK: u8 = 20;
+const SSH_FXP_STATUS: u8 = 101;
+const SSH_FXP_HANDLE: u8 = 102;
+const SSH_FXP_DATA: u8 = 103;
+const SSH_FXP_NAME: u8 = 104;
+const SSH_FXP_ATTRS: u8 = 105;
+const SSH_FXP_EXTENDED: u8 = 200;
+const SSH_FXP_EXTENDED_REPLY: u8 = 201;
+
+// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
+const SSH_FILEXFER_ATTR_SIZE: u32 = 0x00000001;
+const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x00000002;
+const SSH_FILEXFER_ATTR_PERMISSIONS: u32 = 0x00000004;
+const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x00000008;
+const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x80000000;
+
+// defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-6.3
+const SSH_FXF_READ: u32 = 0x00000001;
+const SSH_FXF_WRITE: u32 = 0x00000002;
+const SSH_FXF_APPEND: u32 = 0x00000004;
+const SSH_FXF_CREAT: u32 = 0x00000008;
+const SSH_FXF_TRUNC: u32 = 0x00000010;
+const SSH_FXF_EXCL: u32 = 0x00000020;
+
 pub mod consts {
-    pub const SFTP_PROTOCOL_VERSION: u32 = 3;
-
-    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-3
-    pub const SSH_FXP_INIT: u8 = 1;
-    pub const SSH_FXP_VERSION: u8 = 2;
-    pub const SSH_FXP_OPEN: u8 = 3;
-    pub const SSH_FXP_CLOSE: u8 = 4;
-    pub const SSH_FXP_READ: u8 = 5;
-    pub const SSH_FXP_WRITE: u8 = 6;
-    pub const SSH_FXP_LSTAT: u8 = 7;
-    pub const SSH_FXP_FSTAT: u8 = 8;
-    pub const SSH_FXP_SETSTAT: u8 = 9;
-    pub const SSH_FXP_FSETSTAT: u8 = 10;
-    pub const SSH_FXP_OPENDIR: u8 = 11;
-    pub const SSH_FXP_READDIR: u8 = 12;
-    pub const SSH_FXP_REMOVE: u8 = 13;
-    pub const SSH_FXP_MKDIR: u8 = 14;
-    pub const SSH_FXP_RMDIR: u8 = 15;
-    pub const SSH_FXP_REALPATH: u8 = 16;
-    pub const SSH_FXP_STAT: u8 = 17;
-    pub const SSH_FXP_RENAME: u8 = 18;
-    pub const SSH_FXP_READLINK: u8 = 19;
-    pub const SSH_FXP_SYMLINK: u8 = 20;
-    pub const SSH_FXP_STATUS: u8 = 101;
-    pub const SSH_FXP_HANDLE: u8 = 102;
-    pub const SSH_FXP_DATA: u8 = 103;
-    pub const SSH_FXP_NAME: u8 = 104;
-    pub const SSH_FXP_ATTRS: u8 = 105;
-    pub const SSH_FXP_EXTENDED: u8 = 200;
-    pub const SSH_FXP_EXTENDED_REPLY: u8 = 201;
-
     // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-7
     pub const SSH_FX_OK: u32 = 0;
     pub const SSH_FX_EOF: u32 = 1;
@@ -61,21 +76,6 @@ pub mod consts {
     pub const SSH_FX_NO_CONNECTION: u32 = 6;
     pub const SSH_FX_CONNECTION_LOST: u32 = 7;
     pub const SSH_FX_OP_UNSUPPORTED: u32 = 8;
-
-    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
-    pub const SSH_FILEXFER_ATTR_SIZE: u32 = 0x00000001;
-    pub const SSH_FILEXFER_ATTR_UIDGID: u32 = 0x00000002;
-    pub const SSH_FILEXFER_ATTR_PERMISSIONS: u32 = 0x00000004;
-    pub const SSH_FILEXFER_ATTR_ACMODTIME: u32 = 0x00000008;
-    pub const SSH_FILEXFER_ATTR_EXTENDED: u32 = 0x80000000;
-
-    // defined in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-6.3
-    pub const SSH_FXF_READ: u32 = 0x00000001;
-    pub const SSH_FXF_WRITE: u32 = 0x00000002;
-    pub const SSH_FXF_APPEND: u32 = 0x00000004;
-    pub const SSH_FXF_CREAT: u32 = 0x00000008;
-    pub const SSH_FXF_TRUNC: u32 = 0x00000010;
-    pub const SSH_FXF_EXCL: u32 = 0x00000020;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +97,23 @@ pub enum Error {
     SessionClosed,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+#[derive(Debug, thiserror::Error)]
+#[error("from remote server")]
+pub struct RemoteError(RemoteStatus);
+
+impl RemoteError {
+    pub fn code(&self) -> u32 {
+        self.0.code
+    }
+
+    pub fn message(&self) -> &OsStr {
+        &self.0.message
+    }
+
+    pub fn language_tag(&self) -> &OsStr {
+        &self.0.language_tag
+    }
+}
 
 // described in https://tools.ietf.org/html/draft-ietf-secsh-filexfer-02#section-5
 #[derive(Debug, Default)]
@@ -139,24 +155,6 @@ pub struct DirEntry {
 #[derive(Debug)]
 pub struct FileHandle(OsString);
 
-#[derive(Debug, thiserror::Error)]
-#[error("from remote server")]
-pub struct RemoteError(RemoteStatus);
-
-impl RemoteError {
-    pub fn code(&self) -> u32 {
-        self.0.code
-    }
-
-    pub fn message(&self) -> &OsStr {
-        &self.0.message
-    }
-
-    pub fn language_tag(&self) -> &OsStr {
-        &self.0.language_tag
-    }
-}
-
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -164,7 +162,7 @@ pub struct Session {
 }
 
 impl Session {
-    async fn request(&self, request: Request) -> Result<Response> {
+    async fn request(&self, request: Request) -> Result<Response, Error> {
         let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
 
         let rx = {
@@ -190,9 +188,9 @@ impl Session {
     pub async fn open(
         &self,
         filename: impl AsRef<OsStr>,
-        pflags: u32,
+        pflags: OpenFlag,
         attrs: FileAttr,
-    ) -> Result<FileHandle> {
+    ) -> Result<FileHandle, Error> {
         let response = self
             .request(Request::Open {
                 filename: filename.as_ref().to_owned(),
@@ -210,7 +208,7 @@ impl Session {
     }
 
     /// Request to close a file corresponding to the specified handle.
-    pub async fn close(&self, handle: &FileHandle) -> Result<()> {
+    pub async fn close(&self, handle: &FileHandle) -> Result<(), Error> {
         let response = self
             .request(Request::Close {
                 handle: handle.0.clone(),
@@ -226,7 +224,7 @@ impl Session {
     }
 
     /// Request to read a range of data from an opened file corresponding to the specified handle.
-    pub async fn read(&self, handle: &FileHandle, offset: u64, len: u32) -> Result<Vec<u8>> {
+    pub async fn read(&self, handle: &FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
         let response = self
             .request(Request::Read {
                 handle: handle.0.clone(),
@@ -244,7 +242,7 @@ impl Session {
     }
 
     /// Request to write a range of data to an opened file corresponding to the specified handle.
-    pub async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<()> {
+    pub async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<(), Error> {
         let response = self
             .request(Request::Write {
                 handle: handle.0.clone(),
@@ -263,7 +261,7 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
     #[inline]
-    pub async fn lstat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr> {
+    pub async fn lstat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
         let response = self
             .request(Request::LStat {
                 path: filename.as_ref().to_owned(),
@@ -280,7 +278,7 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr> {
+    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
         let response = self
             .request(Request::FStat {
                 handle: handle.0.clone(),
@@ -295,7 +293,7 @@ impl Session {
         }
     }
 
-    pub async fn setstat(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<()> {
+    pub async fn setstat(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<(), Error> {
         let response = self
             .request(Request::SetStat {
                 path: path.as_ref().to_owned(),
@@ -311,7 +309,7 @@ impl Session {
         }
     }
 
-    pub async fn fsetstat(&self, handle: &FileHandle, attrs: FileAttr) -> Result<()> {
+    pub async fn fsetstat(&self, handle: &FileHandle, attrs: FileAttr) -> Result<(), Error> {
         let response = self
             .request(Request::FSetStat {
                 handle: handle.0.clone(),
@@ -328,7 +326,7 @@ impl Session {
     }
 
     /// Request to open a directory for reading.
-    pub async fn opendir(&self, path: impl AsRef<OsStr>) -> Result<FileHandle> {
+    pub async fn opendir(&self, path: impl AsRef<OsStr>) -> Result<FileHandle, Error> {
         let response = self
             .request(Request::Opendir {
                 path: path.as_ref().to_owned(),
@@ -344,7 +342,7 @@ impl Session {
     }
 
     /// Request to list files and directories contained in an opened directory.
-    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>> {
+    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
         let response = self
             .request(Request::Readdir {
                 handle: handle.0.clone(),
@@ -359,7 +357,7 @@ impl Session {
         }
     }
 
-    pub async fn remove(&self, filename: impl AsRef<OsStr>) -> Result<()> {
+    pub async fn remove(&self, filename: impl AsRef<OsStr>) -> Result<(), Error> {
         let response = self
             .request(Request::Remove {
                 filename: filename.as_ref().to_owned(),
@@ -374,7 +372,7 @@ impl Session {
         }
     }
 
-    pub async fn mkdir(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<()> {
+    pub async fn mkdir(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<(), Error> {
         let response = self
             .request(Request::Mkdir {
                 path: path.as_ref().to_owned(),
@@ -390,7 +388,7 @@ impl Session {
         }
     }
 
-    pub async fn rmdir(&self, path: impl AsRef<OsStr>) -> Result<()> {
+    pub async fn rmdir(&self, path: impl AsRef<OsStr>) -> Result<(), Error> {
         let response = self
             .request(Request::Rmdir {
                 path: path.as_ref().to_owned(),
@@ -405,7 +403,7 @@ impl Session {
         }
     }
 
-    pub async fn realpath(&self, filename: impl AsRef<OsStr>) -> Result<OsString> {
+    pub async fn realpath(&self, filename: impl AsRef<OsStr>) -> Result<OsString, Error> {
         let response = self
             .request(Request::Realpath {
                 path: filename.as_ref().to_owned(),
@@ -422,7 +420,7 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn stat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr> {
+    pub async fn stat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
         let response = self
             .request(Request::Stat {
                 path: filename.as_ref().to_owned(),
@@ -441,7 +439,7 @@ impl Session {
         &self,
         oldpath: impl AsRef<OsStr>,
         newpath: impl AsRef<OsStr>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let response = self
             .request(Request::Rename {
                 oldpath: oldpath.as_ref().to_owned(),
@@ -457,7 +455,7 @@ impl Session {
         }
     }
 
-    pub async fn readlink(&self, path: impl AsRef<OsStr>) -> Result<OsString> {
+    pub async fn readlink(&self, path: impl AsRef<OsStr>) -> Result<OsString, Error> {
         let response = self
             .request(Request::Readlink {
                 path: path.as_ref().to_owned(),
@@ -476,7 +474,7 @@ impl Session {
         &self,
         linkpath: impl AsRef<OsStr>,
         targetpath: impl AsRef<OsStr>,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let response = self
             .request(Request::Symlink {
                 linkpath: linkpath.as_ref().to_owned(),
@@ -492,7 +490,11 @@ impl Session {
         }
     }
 
-    pub async fn extended(&self, request: impl AsRef<OsStr>, data: &[u8]) -> Result<Vec<u8>> {
+    pub async fn extended(
+        &self,
+        request: impl AsRef<OsStr>,
+        data: &[u8],
+    ) -> Result<Vec<u8>, Error> {
         let response = self
             .request(Request::Extended {
                 request: request.as_ref().to_owned(),
@@ -506,6 +508,41 @@ impl Session {
                 msg: "incorrect response type".into(),
             }),
         }
+    }
+}
+
+bitflags::bitflags! {
+    /// Open file flags.
+    #[repr(transparent)]
+    pub struct OpenFlag: u32 {
+        /// Open the file for reading.
+        const READ = SSH_FXF_READ;
+
+        /// Open the file for writing.
+        const WRITE = SSH_FXF_WRITE;
+
+        /// Force all writes to append data at the end of the file.
+        const APPEND = SSH_FXF_APPEND;
+
+        /// A new file will be created if one does not already exist.
+        ///
+        /// When [`TRUNC`](Self::TRUNC) is specified at the same time
+        /// as this flag, the new file will be truncated to zero length
+        /// if it previously exists.
+        const CREAT = SSH_FXF_CREAT;
+
+        /// Forces an existing file with the same name to be truncated
+        /// to zero length when creating a file.
+        ///
+        /// This flag MUST be specified with [`CREAT`](Self::CREAT) if
+        /// it is used.
+        const TRUNC = SSH_FXF_TRUNC;
+
+        /// Causes the request to fail if the named file already exists.
+        ///
+        /// This flag MUST be specified with [`CREAT`](Self::CREAT) if
+        /// it is used.
+        const EXCL = SSH_FXF_EXCL;
     }
 }
 
@@ -537,7 +574,7 @@ impl<W> SendRequest<W>
 where
     W: AsyncWrite + Unpin,
 {
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<(), Error> {
         let mut me = self;
 
         while let Some((id, req)) = me.incoming_requests.recv().await {
@@ -547,7 +584,8 @@ where
                     pflags,
                     attrs,
                 } => {
-                    me.send_open_request(id, &filename, pflags, &attrs).await?;
+                    me.send_open_request(id, &filename, pflags.bits(), &attrs)
+                        .await?;
                 }
 
                 Request::Close { handle } => {
@@ -659,7 +697,12 @@ where
         Ok(())
     }
 
-    async fn send_string_request(&mut self, id: u32, packet_type: u8, s: &OsStr) -> Result<()> {
+    async fn send_string_request(
+        &mut self,
+        id: u32,
+        packet_type: u8,
+        s: &OsStr,
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + s(string)
         let length = 1 + 4 + string_len(s.len());
 
@@ -678,7 +721,7 @@ where
         packet_type: u8,
         s1: &OsStr,
         s2: &OsStr,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + s1(string) + s2(string)
         let length = 1 + 4 + string_len(s1.len()) + string_len(s2.len());
 
@@ -698,7 +741,7 @@ where
         packet_type: u8,
         s: &OsStr,
         attrs: &FileAttr,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + s(string) + attrs
         let length = 1 + 4 + string_len(s.len()) + attrs_len(attrs);
 
@@ -718,7 +761,7 @@ where
         filename: &OsStr,
         pflags: u32,
         attrs: &FileAttr,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + filename(string) + pflags(u32) + attrs
         let length = 1 + 4 + string_len(filename.len()) + 4 + attrs_len(attrs);
 
@@ -737,7 +780,7 @@ where
         handle: &OsStr,
         offset: u64,
         len: u32,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + handle(string) + offset(u64) + len(u32)
         let length = 1 + 4 + string_len(handle.len()) + 8 + 4;
 
@@ -757,7 +800,7 @@ where
         handle: &OsStr,
         offset: u64,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + handle(string) + offset(u64) + data(string)
         let length = 1 + 4 + string_len(handle.len()) + 8 + string_len(data.len());
 
@@ -771,7 +814,12 @@ where
         Ok(())
     }
 
-    async fn send_extended_request(&mut self, id: u32, request: &OsStr, data: &[u8]) -> Result<()> {
+    async fn send_extended_request(
+        &mut self,
+        id: u32,
+        request: &OsStr,
+        data: &[u8],
+    ) -> Result<(), Error> {
         // type(u8) + id(u32) + reqeust(string) + data(opaque bytes)
         let length = 1 + 4 + string_len(request.len()) + data.len() as u32;
 
@@ -797,7 +845,7 @@ impl<R> ReceiveResponse<R>
 where
     R: AsyncRead + Unpin,
 {
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<(), Error> {
         let mut me = self;
 
         loop {
@@ -810,7 +858,7 @@ where
         }
     }
 
-    async fn receive_response(&mut self) -> Result<(u32, Response)> {
+    async fn receive_response(&mut self) -> Result<(u32, Response), Error> {
         let length = read_u32(&mut self.reader).await?;
         let mut reader = AsyncReadExt::take(&mut self.reader, length as u64);
 
@@ -883,7 +931,7 @@ where
 enum Request {
     Open {
         filename: OsString,
-        pflags: u32,
+        pflags: OpenFlag,
         attrs: FileAttr,
     },
     Close {
@@ -988,7 +1036,7 @@ struct RemoteStatus {
 /// Start a SFTP session on the provided transport I/O.
 ///
 /// This is a shortcut to `InitSession::default().init(r, w)`.
-pub async fn init<R, W>(r: R, w: W) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
+pub async fn init<R, W>(r: R, w: W) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>), Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1040,7 +1088,7 @@ impl InitSession {
         &self,
         r: R,
         w: W,
-    ) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
+    ) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>), Error>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -1129,7 +1177,7 @@ fn string_len(n: usize) -> u32 {
     4 + n as u32
 }
 
-async fn write_u8<W>(mut w: W, val: u8) -> Result<()>
+async fn write_u8<W>(mut w: W, val: u8) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1137,7 +1185,7 @@ where
     Ok(())
 }
 
-async fn write_u32<W>(mut w: W, val: u32) -> Result<()>
+async fn write_u32<W>(mut w: W, val: u32) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1145,7 +1193,7 @@ where
     Ok(())
 }
 
-async fn write_u64<W>(mut w: W, val: u64) -> Result<()>
+async fn write_u64<W>(mut w: W, val: u64) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1153,7 +1201,7 @@ where
     Ok(())
 }
 
-async fn write_string<W>(mut w: W, s: &[u8]) -> Result<()>
+async fn write_string<W>(mut w: W, s: &[u8]) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1190,7 +1238,7 @@ fn attrs_len(attrs: &FileAttr) -> u32 {
     len
 }
 
-async fn write_attrs<W>(mut w: W, attrs: &FileAttr) -> Result<()>
+async fn write_attrs<W>(mut w: W, attrs: &FileAttr) -> Result<(), Error>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1235,7 +1283,7 @@ where
     Ok(())
 }
 
-async fn read_u8<R>(mut r: R) -> Result<u8>
+async fn read_u8<R>(mut r: R) -> Result<u8, Error>
 where
     R: AsyncRead + Unpin,
 {
@@ -1244,7 +1292,7 @@ where
     Ok(u8::from_be_bytes(buf))
 }
 
-async fn read_u32<R>(mut r: R) -> Result<u32>
+async fn read_u32<R>(mut r: R) -> Result<u32, Error>
 where
     R: AsyncRead + Unpin,
 {
@@ -1253,7 +1301,7 @@ where
     Ok(u32::from_be_bytes(buf))
 }
 
-async fn read_u64<R>(mut r: R) -> Result<u64>
+async fn read_u64<R>(mut r: R) -> Result<u64, Error>
 where
     R: AsyncRead + Unpin,
 {
@@ -1262,7 +1310,7 @@ where
     Ok(u64::from_be_bytes(buf))
 }
 
-async fn read_string<R>(mut r: R) -> Result<OsString>
+async fn read_string<R>(mut r: R) -> Result<OsString, Error>
 where
     R: AsyncRead + Unpin,
 {
@@ -1275,7 +1323,7 @@ where
     Ok(s)
 }
 
-async fn read_file_attr<R>(mut r: R) -> Result<FileAttr>
+async fn read_file_attr<R>(mut r: R) -> Result<FileAttr, Error>
 where
     R: AsyncRead + Unpin,
 {
