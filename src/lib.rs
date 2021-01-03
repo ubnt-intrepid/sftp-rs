@@ -152,8 +152,8 @@ pub struct DirEntry {
     pub attrs: FileAttr,
 }
 
-#[derive(Debug)]
-pub struct FileHandle(OsString);
+#[derive(Debug, Clone)]
+pub struct FileHandle(Arc<OsStr>);
 
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
@@ -187,13 +187,13 @@ impl Session {
     /// Request to open a file.
     pub async fn open(
         &self,
-        filename: impl AsRef<OsStr>,
+        filename: Cow<'static, OsStr>,
         pflags: OpenFlag,
         attrs: FileAttr,
     ) -> Result<FileHandle, Error> {
         let response = self
             .request(Request::Open {
-                filename: filename.as_ref().to_owned(),
+                filename,
                 pflags,
                 attrs,
             })
@@ -208,12 +208,8 @@ impl Session {
     }
 
     /// Request to close a file corresponding to the specified handle.
-    pub async fn close(&self, handle: &FileHandle) -> Result<(), Error> {
-        let response = self
-            .request(Request::Close {
-                handle: handle.0.clone(),
-            })
-            .await?;
+    pub async fn close(&self, handle: FileHandle) -> Result<(), Error> {
+        let response = self.request(Request::Close { handle }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -224,10 +220,10 @@ impl Session {
     }
 
     /// Request to read a range of data from an opened file corresponding to the specified handle.
-    pub async fn read(&self, handle: &FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
+    pub async fn read(&self, handle: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
         let response = self
             .request(Request::Read {
-                handle: handle.0.clone(),
+                handle,
                 offset,
                 len,
             })
@@ -242,12 +238,17 @@ impl Session {
     }
 
     /// Request to write a range of data to an opened file corresponding to the specified handle.
-    pub async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<(), Error> {
+    pub async fn write(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        data: Cow<'static, [u8]>,
+    ) -> Result<(), Error> {
         let response = self
             .request(Request::Write {
-                handle: handle.0.clone(),
+                handle,
                 offset,
-                data: data.to_owned(),
+                data,
             })
             .await?;
         match response {
@@ -261,12 +262,8 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
     #[inline]
-    pub async fn lstat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
-        let response = self
-            .request(Request::LStat {
-                path: filename.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn lstat(&self, path: Cow<'static, OsStr>) -> Result<FileAttr, Error> {
+        let response = self.request(Request::LStat { path }).await?;
         match response {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -278,12 +275,8 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
-        let response = self
-            .request(Request::FStat {
-                handle: handle.0.clone(),
-            })
-            .await?;
+    pub async fn fstat(&self, handle: FileHandle) -> Result<FileAttr, Error> {
+        let response = self.request(Request::FStat { handle }).await?;
         match response {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -293,13 +286,8 @@ impl Session {
         }
     }
 
-    pub async fn setstat(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<(), Error> {
-        let response = self
-            .request(Request::SetStat {
-                path: path.as_ref().to_owned(),
-                attrs,
-            })
-            .await?;
+    pub async fn setstat(&self, path: Cow<'static, OsStr>, attrs: FileAttr) -> Result<(), Error> {
+        let response = self.request(Request::SetStat { path, attrs }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -309,13 +297,8 @@ impl Session {
         }
     }
 
-    pub async fn fsetstat(&self, handle: &FileHandle, attrs: FileAttr) -> Result<(), Error> {
-        let response = self
-            .request(Request::FSetStat {
-                handle: handle.0.clone(),
-                attrs,
-            })
-            .await?;
+    pub async fn fsetstat(&self, handle: FileHandle, attrs: FileAttr) -> Result<(), Error> {
+        let response = self.request(Request::FSetStat { handle, attrs }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -326,12 +309,8 @@ impl Session {
     }
 
     /// Request to open a directory for reading.
-    pub async fn opendir(&self, path: impl AsRef<OsStr>) -> Result<FileHandle, Error> {
-        let response = self
-            .request(Request::Opendir {
-                path: path.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn opendir(&self, path: Cow<'static, OsStr>) -> Result<FileHandle, Error> {
+        let response = self.request(Request::Opendir { path }).await?;
         match response {
             Response::Handle(handle) => Ok(handle),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -342,12 +321,8 @@ impl Session {
     }
 
     /// Request to list files and directories contained in an opened directory.
-    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
-        let response = self
-            .request(Request::Readdir {
-                handle: handle.0.clone(),
-            })
-            .await?;
+    pub async fn readdir(&self, handle: FileHandle) -> Result<Vec<DirEntry>, Error> {
+        let response = self.request(Request::Readdir { handle }).await?;
         match response {
             Response::Name(entries) => Ok(entries),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -357,12 +332,8 @@ impl Session {
         }
     }
 
-    pub async fn remove(&self, filename: impl AsRef<OsStr>) -> Result<(), Error> {
-        let response = self
-            .request(Request::Remove {
-                filename: filename.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn remove(&self, filename: Cow<'static, OsStr>) -> Result<(), Error> {
+        let response = self.request(Request::Remove { filename }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -372,13 +343,8 @@ impl Session {
         }
     }
 
-    pub async fn mkdir(&self, path: impl AsRef<OsStr>, attrs: FileAttr) -> Result<(), Error> {
-        let response = self
-            .request(Request::Mkdir {
-                path: path.as_ref().to_owned(),
-                attrs,
-            })
-            .await?;
+    pub async fn mkdir(&self, path: Cow<'static, OsStr>, attrs: FileAttr) -> Result<(), Error> {
+        let response = self.request(Request::Mkdir { path, attrs }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -388,12 +354,8 @@ impl Session {
         }
     }
 
-    pub async fn rmdir(&self, path: impl AsRef<OsStr>) -> Result<(), Error> {
-        let response = self
-            .request(Request::Rmdir {
-                path: path.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn rmdir(&self, path: Cow<'static, OsStr>) -> Result<(), Error> {
+        let response = self.request(Request::Rmdir { path }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -403,12 +365,8 @@ impl Session {
         }
     }
 
-    pub async fn realpath(&self, filename: impl AsRef<OsStr>) -> Result<OsString, Error> {
-        let response = self
-            .request(Request::Realpath {
-                path: filename.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn realpath(&self, path: Cow<'static, OsStr>) -> Result<OsString, Error> {
+        let response = self.request(Request::Realpath { path }).await?;
         match response {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -420,12 +378,8 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn stat(&self, filename: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
-        let response = self
-            .request(Request::Stat {
-                path: filename.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn stat(&self, path: Cow<'static, OsStr>) -> Result<FileAttr, Error> {
+        let response = self.request(Request::Stat { path }).await?;
         match response {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -437,15 +391,10 @@ impl Session {
 
     pub async fn rename(
         &self,
-        oldpath: impl AsRef<OsStr>,
-        newpath: impl AsRef<OsStr>,
+        oldpath: Cow<'static, OsStr>,
+        newpath: Cow<'static, OsStr>,
     ) -> Result<(), Error> {
-        let response = self
-            .request(Request::Rename {
-                oldpath: oldpath.as_ref().to_owned(),
-                newpath: newpath.as_ref().to_owned(),
-            })
-            .await?;
+        let response = self.request(Request::Rename { oldpath, newpath }).await?;
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -455,12 +404,8 @@ impl Session {
         }
     }
 
-    pub async fn readlink(&self, path: impl AsRef<OsStr>) -> Result<OsString, Error> {
-        let response = self
-            .request(Request::Readlink {
-                path: path.as_ref().to_owned(),
-            })
-            .await?;
+    pub async fn readlink(&self, path: Cow<'static, OsStr>) -> Result<OsString, Error> {
+        let response = self.request(Request::Readlink { path }).await?;
         match response {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -472,13 +417,13 @@ impl Session {
 
     pub async fn symlink(
         &self,
-        linkpath: impl AsRef<OsStr>,
-        targetpath: impl AsRef<OsStr>,
+        linkpath: Cow<'static, OsStr>,
+        targetpath: Cow<'static, OsStr>,
     ) -> Result<(), Error> {
         let response = self
             .request(Request::Symlink {
-                linkpath: linkpath.as_ref().to_owned(),
-                targetpath: targetpath.as_ref().to_owned(),
+                linkpath,
+                targetpath,
             })
             .await?;
         match response {
@@ -492,15 +437,10 @@ impl Session {
 
     pub async fn extended(
         &self,
-        request: impl AsRef<OsStr>,
-        data: &[u8],
+        request: Cow<'static, OsStr>,
+        data: Cow<'static, [u8]>,
     ) -> Result<Vec<u8>, Error> {
-        let response = self
-            .request(Request::Extended {
-                request: request.as_ref().to_owned(),
-                data: data.to_owned(),
-            })
-            .await?;
+        let response = self.request(Request::Extended { request, data }).await?;
         match response {
             Response::Extended(data) => Ok(data),
             Response::Status(st) if st.code != SSH_FX_OK => Err(Error::Remote(RemoteError(st))),
@@ -589,7 +529,8 @@ where
                 }
 
                 Request::Close { handle } => {
-                    me.send_string_request(id, SSH_FXP_CLOSE, &handle).await?;
+                    me.send_string_request(id, SSH_FXP_CLOSE, &*handle.0)
+                        .await?;
                 }
 
                 Request::Read {
@@ -597,7 +538,7 @@ where
                     offset,
                     len,
                 } => {
-                    me.send_read_request(id, &handle, offset, len).await?;
+                    me.send_read_request(id, &*handle.0, offset, len).await?;
                 }
 
                 Request::Write {
@@ -605,7 +546,7 @@ where
                     offset,
                     data,
                 } => {
-                    me.send_write_request(id, &handle, offset, &data).await?;
+                    me.send_write_request(id, &*handle.0, offset, &data).await?;
                 }
 
                 Request::LStat { path } => {
@@ -613,7 +554,8 @@ where
                 }
 
                 Request::FStat { handle } => {
-                    me.send_string_request(id, SSH_FXP_FSTAT, &handle).await?;
+                    me.send_string_request(id, SSH_FXP_FSTAT, &*handle.0)
+                        .await?;
                 }
 
                 Request::SetStat { path, attrs } => {
@@ -622,7 +564,7 @@ where
                 }
 
                 Request::FSetStat { handle, attrs } => {
-                    me.send_string_attrs_request(id, SSH_FXP_FSETSTAT, &handle, &attrs)
+                    me.send_string_attrs_request(id, SSH_FXP_FSETSTAT, &*handle.0, &attrs)
                         .await?;
                 }
 
@@ -631,7 +573,8 @@ where
                 }
 
                 Request::Readdir { handle } => {
-                    me.send_string_request(id, SSH_FXP_READDIR, &handle).await?;
+                    me.send_string_request(id, SSH_FXP_READDIR, &*handle.0)
+                        .await?;
                 }
 
                 Request::Remove { filename } => {
@@ -879,7 +822,7 @@ where
 
             SSH_FXP_HANDLE => {
                 let handle = read_string(&mut reader).await?;
-                Response::Handle(FileHandle(handle))
+                Response::Handle(FileHandle(handle.into_boxed_os_str().into()))
             }
 
             SSH_FXP_DATA => {
@@ -930,74 +873,74 @@ where
 #[derive(Debug)]
 enum Request {
     Open {
-        filename: OsString,
+        filename: Cow<'static, OsStr>,
         pflags: OpenFlag,
         attrs: FileAttr,
     },
     Close {
-        handle: OsString,
+        handle: FileHandle,
     },
     Read {
-        handle: OsString,
+        handle: FileHandle,
         offset: u64,
         len: u32,
     },
     Write {
-        handle: OsString,
+        handle: FileHandle,
         offset: u64,
-        data: Vec<u8>,
+        data: Cow<'static, [u8]>,
     },
     LStat {
-        path: OsString,
+        path: Cow<'static, OsStr>,
     },
     FStat {
-        handle: OsString,
+        handle: FileHandle,
     },
     SetStat {
-        path: OsString,
+        path: Cow<'static, OsStr>,
         attrs: FileAttr,
     },
     FSetStat {
-        handle: OsString,
+        handle: FileHandle,
         attrs: FileAttr,
     },
     Opendir {
-        path: OsString,
+        path: Cow<'static, OsStr>,
     },
     Readdir {
-        handle: OsString,
+        handle: FileHandle,
     },
     Remove {
-        filename: OsString,
+        filename: Cow<'static, OsStr>,
     },
     Mkdir {
-        path: OsString,
+        path: Cow<'static, OsStr>,
         attrs: FileAttr,
     },
     Rmdir {
-        path: OsString,
+        path: Cow<'static, OsStr>,
     },
     Realpath {
-        path: OsString,
+        path: Cow<'static, OsStr>,
     },
     Stat {
-        path: OsString,
+        path: Cow<'static, OsStr>,
     },
     Rename {
-        oldpath: OsString,
-        newpath: OsString,
+        oldpath: Cow<'static, OsStr>,
+        newpath: Cow<'static, OsStr>,
     },
     Readlink {
-        path: OsString,
+        path: Cow<'static, OsStr>,
     },
     Symlink {
-        linkpath: OsString,
-        targetpath: OsString,
+        linkpath: Cow<'static, OsStr>,
+        targetpath: Cow<'static, OsStr>,
     },
 
     Extended {
-        request: OsString,
-        data: Vec<u8>,
+        request: Cow<'static, OsStr>,
+        data: Cow<'static, [u8]>,
     },
 }
 
