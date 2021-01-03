@@ -160,28 +160,29 @@ impl RemoteError {
 /// The handle for communicating with associated SFTP session.
 #[derive(Debug, Clone)]
 pub struct Session {
-    inner: Weak<Mutex<Inner>>,
+    inner: Weak<Inner>,
 }
 
 impl Session {
     async fn request(&self, request: Request) -> Result<Response> {
-        let rx = {
-            let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
-            let inner = &mut *inner.lock().unwrap();
+        let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
 
-            let id = inner.next_request_id;
+        let rx = {
+            let pending_requests = &mut *inner.pending_requests.lock().unwrap();
+            let id = pending_requests.next_request_id;
 
             inner.incoming_requests.send((id, request)).map_err(|_| {
                 io::Error::new(io::ErrorKind::ConnectionAborted, "session is not available")
             })?;
 
             let (tx, rx) = oneshot::channel();
-            inner.pending_requests.insert(id, tx);
+            pending_requests.senders.insert(id, tx);
 
-            inner.next_request_id = inner.next_request_id.wrapping_add(1);
+            pending_requests.next_request_id = pending_requests.next_request_id.wrapping_add(1);
 
             rx
         };
+
         rx.await.map_err(|_| Error::SessionClosed)
     }
 
@@ -513,8 +514,14 @@ impl Session {
 #[derive(Debug)]
 struct Inner {
     extensions: Vec<(OsString, OsString)>,
+    reverse_symlink_arguments: bool,
     incoming_requests: mpsc::UnboundedSender<(u32, Request)>,
-    pending_requests: HashMap<u32, oneshot::Sender<Response>>,
+    pending_requests: Mutex<PendingRequests>,
+}
+
+#[derive(Debug)]
+struct PendingRequests {
+    senders: HashMap<u32, oneshot::Sender<Response>>,
     next_request_id: u32,
 }
 
@@ -522,7 +529,7 @@ struct Inner {
 #[must_use]
 pub struct SendRequest<W> {
     writer: W,
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Inner>,
     incoming_requests: mpsc::UnboundedReceiver<(u32, Request)>,
 }
 
@@ -530,20 +537,21 @@ impl<W> SendRequest<W>
 where
     W: AsyncWrite + Unpin,
 {
-    pub async fn run(mut self) -> Result<()> {
-        while let Some((id, req)) = self.incoming_requests.recv().await {
+    pub async fn run(self) -> Result<()> {
+        let mut me = self;
+
+        while let Some((id, req)) = me.incoming_requests.recv().await {
             match req {
                 Request::Open {
                     filename,
                     pflags,
                     attrs,
                 } => {
-                    self.send_open_request(id, &filename, pflags, &attrs)
-                        .await?;
+                    me.send_open_request(id, &filename, pflags, &attrs).await?;
                 }
 
                 Request::Close { handle } => {
-                    self.send_string_request(id, SSH_FXP_CLOSE, &handle).await?;
+                    me.send_string_request(id, SSH_FXP_CLOSE, &handle).await?;
                 }
 
                 Request::Read {
@@ -551,7 +559,7 @@ where
                     offset,
                     len,
                 } => {
-                    self.send_read_request(id, &handle, offset, len).await?;
+                    me.send_read_request(id, &handle, offset, len).await?;
                 }
 
                 Request::Write {
@@ -559,69 +567,76 @@ where
                     offset,
                     data,
                 } => {
-                    self.send_write_request(id, &handle, offset, &data).await?;
+                    me.send_write_request(id, &handle, offset, &data).await?;
                 }
 
                 Request::LStat { path } => {
-                    self.send_string_request(id, SSH_FXP_LSTAT, &path).await?;
+                    me.send_string_request(id, SSH_FXP_LSTAT, &path).await?;
                 }
 
                 Request::FStat { handle } => {
-                    self.send_string_request(id, SSH_FXP_FSTAT, &handle).await?;
+                    me.send_string_request(id, SSH_FXP_FSTAT, &handle).await?;
                 }
 
                 Request::SetStat { path, attrs } => {
-                    self.send_string_attrs_request(id, SSH_FXP_SETSTAT, &path, &attrs)
+                    me.send_string_attrs_request(id, SSH_FXP_SETSTAT, &path, &attrs)
                         .await?;
                 }
 
                 Request::FSetStat { handle, attrs } => {
-                    self.send_string_attrs_request(id, SSH_FXP_FSETSTAT, &handle, &attrs)
+                    me.send_string_attrs_request(id, SSH_FXP_FSETSTAT, &handle, &attrs)
                         .await?;
                 }
 
                 Request::Opendir { path } => {
-                    self.send_string_request(id, SSH_FXP_OPENDIR, &path).await?;
+                    me.send_string_request(id, SSH_FXP_OPENDIR, &path).await?;
                 }
 
                 Request::Readdir { handle } => {
-                    self.send_string_request(id, SSH_FXP_READDIR, &handle)
-                        .await?;
+                    me.send_string_request(id, SSH_FXP_READDIR, &handle).await?;
                 }
 
                 Request::Remove { filename } => {
-                    self.send_string_request(id, SSH_FXP_REMOVE, &filename)
+                    me.send_string_request(id, SSH_FXP_REMOVE, &filename)
                         .await?;
                 }
 
                 Request::Mkdir { path, attrs } => {
-                    self.send_string_attrs_request(id, SSH_FXP_MKDIR, &path, &attrs)
+                    me.send_string_attrs_request(id, SSH_FXP_MKDIR, &path, &attrs)
                         .await?;
                 }
 
                 Request::Rmdir { path } => {
-                    self.send_string_request(id, SSH_FXP_RMDIR, &path).await?;
+                    me.send_string_request(id, SSH_FXP_RMDIR, &path).await?;
                 }
 
                 Request::Realpath { path } => {
-                    self.send_string_request(id, SSH_FXP_REALPATH, &path)
-                        .await?;
+                    me.send_string_request(id, SSH_FXP_REALPATH, &path).await?;
                 }
 
                 Request::Stat { path } => {
-                    self.send_string_request(id, SSH_FXP_STAT, &path).await?;
+                    me.send_string_request(id, SSH_FXP_STAT, &path).await?;
                 }
 
                 Request::Rename {
                     oldpath: oldname,
                     newpath: newname,
                 } => {
-                    self.send_string_2_request(id, SSH_FXP_RENAME, &oldname, &newname)
+                    me.send_string_2_request(id, SSH_FXP_RENAME, &oldname, &newname)
                         .await?;
                 }
 
                 Request::Readlink { path } => {
-                    self.send_string_request(id, SSH_FXP_READLINK, &path)
+                    me.send_string_request(id, SSH_FXP_READLINK, &path).await?;
+                }
+
+                Request::Symlink {
+                    ref linkpath,
+                    ref targetpath,
+                } if me.inner.reverse_symlink_arguments => {
+                    // In OpenSSH's sftp-server implementation, the order of arguments to SSH_FXP_SYMLINK
+                    // is inadvertently reversed and it is not fixed for compatibility reason.
+                    me.send_string_2_request(id, SSH_FXP_SYMLINK, &targetpath, &linkpath)
                         .await?;
                 }
 
@@ -629,16 +644,16 @@ where
                     linkpath,
                     targetpath,
                 } => {
-                    self.send_string_2_request(id, SSH_FXP_SYMLINK, &linkpath, &targetpath)
+                    me.send_string_2_request(id, SSH_FXP_SYMLINK, &linkpath, &targetpath)
                         .await?;
                 }
 
                 Request::Extended { request, data } => {
-                    self.send_extended_request(id, &request, &data).await?;
+                    me.send_extended_request(id, &request, &data).await?;
                 }
             }
 
-            self.writer.flush().await?;
+            me.writer.flush().await?;
         }
 
         Ok(())
@@ -771,6 +786,344 @@ where
     }
 }
 
+#[derive(Debug)]
+#[must_use]
+pub struct ReceiveResponse<R> {
+    reader: R,
+    inner: Arc<Inner>,
+}
+
+impl<R> ReceiveResponse<R>
+where
+    R: AsyncRead + Unpin,
+{
+    pub async fn run(self) -> Result<()> {
+        let mut me = self;
+
+        loop {
+            let (id, resp) = me.receive_response().await?;
+
+            let pending_requests = &mut *me.inner.pending_requests.lock().unwrap();
+            if let Some(tx) = pending_requests.senders.remove(&id) {
+                let _ = tx.send(resp);
+            }
+        }
+    }
+
+    async fn receive_response(&mut self) -> Result<(u32, Response)> {
+        let length = read_u32(&mut self.reader).await?;
+        let mut reader = AsyncReadExt::take(&mut self.reader, length as u64);
+
+        let typ = read_u8(&mut reader).await?;
+        let id = read_u32(&mut reader).await?;
+
+        let response = match typ {
+            SSH_FXP_STATUS => {
+                let code = read_u32(&mut reader).await?;
+                let message = read_string(&mut reader).await?;
+                let language_tag = read_string(&mut reader).await?;
+                Response::Status(RemoteStatus {
+                    code,
+                    message,
+                    language_tag,
+                })
+            }
+
+            SSH_FXP_HANDLE => {
+                let handle = read_string(&mut reader).await?;
+                Response::Handle(FileHandle(handle))
+            }
+
+            SSH_FXP_DATA => {
+                let data = read_string(&mut reader).await?;
+                Response::Data(data.into_vec())
+            }
+
+            SSH_FXP_ATTRS => {
+                let attrs = read_file_attr(&mut reader).await?;
+                Response::Attrs(attrs)
+            }
+
+            SSH_FXP_NAME => {
+                let count = read_u32(&mut reader).await?;
+                let mut entries = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let filename = read_string(&mut reader).await?;
+                    let longname = read_string(&mut reader).await?;
+                    let attrs = read_file_attr(&mut reader).await?;
+                    entries.push(DirEntry {
+                        filename,
+                        longname,
+                        attrs,
+                    });
+                }
+                Response::Name(entries)
+            }
+
+            SSH_FXP_EXTENDED_REPLY => {
+                let mut data = vec![];
+                reader.read_to_end(&mut data).await?;
+                Response::Extended(data)
+            }
+
+            typ => {
+                let mut data = vec![];
+                reader.read_to_end(&mut data).await?;
+                Response::Unknown { typ, data }
+            }
+        };
+
+        debug_assert_eq!(reader.limit(), 0);
+
+        Ok((id, response))
+    }
+}
+
+#[derive(Debug)]
+enum Request {
+    Open {
+        filename: OsString,
+        pflags: u32,
+        attrs: FileAttr,
+    },
+    Close {
+        handle: OsString,
+    },
+    Read {
+        handle: OsString,
+        offset: u64,
+        len: u32,
+    },
+    Write {
+        handle: OsString,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    LStat {
+        path: OsString,
+    },
+    FStat {
+        handle: OsString,
+    },
+    SetStat {
+        path: OsString,
+        attrs: FileAttr,
+    },
+    FSetStat {
+        handle: OsString,
+        attrs: FileAttr,
+    },
+    Opendir {
+        path: OsString,
+    },
+    Readdir {
+        handle: OsString,
+    },
+    Remove {
+        filename: OsString,
+    },
+    Mkdir {
+        path: OsString,
+        attrs: FileAttr,
+    },
+    Rmdir {
+        path: OsString,
+    },
+    Realpath {
+        path: OsString,
+    },
+    Stat {
+        path: OsString,
+    },
+    Rename {
+        oldpath: OsString,
+        newpath: OsString,
+    },
+    Readlink {
+        path: OsString,
+    },
+    Symlink {
+        linkpath: OsString,
+        targetpath: OsString,
+    },
+
+    Extended {
+        request: OsString,
+        data: Vec<u8>,
+    },
+}
+
+/// The kind of response values received from the server.
+#[derive(Debug)]
+enum Response {
+    /// The operation is failed.
+    Status(RemoteStatus),
+
+    /// An opened file handle.
+    Handle(FileHandle),
+
+    /// Received data.
+    Data(Vec<u8>),
+
+    /// Retrieved attribute values.
+    Attrs(FileAttr),
+
+    /// Directory entries.
+    Name(Vec<DirEntry>),
+
+    /// Reply from an vendor-specific extended request.
+    Extended(Vec<u8>),
+
+    /// The response type is unknown or currently not supported.
+    Unknown { typ: u8, data: Vec<u8> },
+}
+
+#[derive(Debug)]
+struct RemoteStatus {
+    code: u32,
+    message: OsString,
+    language_tag: OsString,
+}
+
+/// Start a SFTP session on the provided transport I/O.
+///
+/// This is a shortcut to `InitSession::default().init(r, w)`.
+pub async fn init<R, W>(r: R, w: W) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    InitSession::default().init(r, w).await
+}
+
+#[derive(Debug)]
+pub struct InitSession {
+    reverse_symlink_arguments: bool,
+    extensions: Vec<(OsString, OsString)>,
+}
+
+impl Default for InitSession {
+    fn default() -> Self {
+        Self {
+            reverse_symlink_arguments: true,
+            extensions: vec![],
+        }
+    }
+}
+
+impl InitSession {
+    /// Reverse the order of arguments in symlink request.
+    ///
+    /// For historical reason, the SFTP server implementation provied by OpenSSH
+    /// (`sftp-server`) requiers that the order of arguments in the `SSH_FXP_SYMLINK`
+    /// requests be the opposite of what is defined in RFC draft.
+    ///
+    /// This flag is enabled by default, as most SFTP servers are expected to
+    /// use OpenSSH's implementation.
+    pub fn reverse_symlink_arguments(&mut self, enabled: bool) -> &mut Self {
+        self.reverse_symlink_arguments = enabled;
+        self
+    }
+
+    pub fn extension(&mut self, name: OsString, data: OsString) -> &mut Self {
+        self.extensions.push((name, data));
+        self
+    }
+
+    /// Start a SFTP session on the provided transport I/O.
+    ///
+    /// This function first exchanges some packets with the server and negotiates
+    /// the settings of SFTP protocol to use.  When the initialization process is
+    /// successed, it returns a handle to send subsequent SFTP requests from the
+    /// client and objects to drive the underlying communication with the server.
+    pub async fn init<R, W>(
+        &self,
+        r: R,
+        w: W,
+    ) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let mut r = r;
+        let mut w = w;
+
+        // send SSH_FXP_INIT packet.
+        w.write_all(&5u32.to_be_bytes()).await?; // length = type(= 1byte) + version(= 4byte)
+        w.write_all(&SSH_FXP_INIT.to_be_bytes()).await?;
+        w.write_all(&SFTP_PROTOCOL_VERSION.to_be_bytes()).await?;
+        for (name, data) in &self.extensions {
+            write_string(&mut w, name.as_bytes()).await?;
+            write_string(&mut w, data.as_bytes()).await?;
+        }
+        w.flush().await?;
+
+        // receive SSH_FXP_VERSION packet.
+        let mut extensions = vec![];
+        {
+            let length = read_u32(&mut r).await?;
+            let mut r = AsyncReadExt::take(&mut r, length as u64);
+
+            let typ = read_u8(&mut r).await?;
+            if typ != SSH_FXP_VERSION {
+                return Err(Error::Protocol {
+                    msg: "incorrect message type during initialization".into(),
+                });
+            }
+
+            let version = read_u32(&mut r).await?;
+            if version < SFTP_PROTOCOL_VERSION {
+                return Err(Error::Protocol {
+                    msg: "server supports older SFTP protocol".into(),
+                });
+            }
+
+            loop {
+                match read_string(&mut r).await {
+                    Ok(name) => {
+                        let data = read_string(&mut r).await?;
+                        extensions.push((name, data));
+                    }
+                    Err(Error::Transport(ref err))
+                        if err.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        break
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let inner = Arc::new(Inner {
+            extensions,
+            reverse_symlink_arguments: self.reverse_symlink_arguments,
+            incoming_requests: tx,
+            pending_requests: Mutex::new(PendingRequests {
+                senders: HashMap::new(),
+                next_request_id: 0,
+            }),
+        });
+
+        let session = Session {
+            inner: Arc::downgrade(&inner),
+        };
+
+        let send = SendRequest {
+            writer: w,
+            inner: Arc::clone(&inner),
+            incoming_requests: rx,
+        };
+
+        let recv = ReceiveResponse { reader: r, inner };
+
+        Ok((session, send, recv))
+    }
+}
+
+// ==== misc ====
+
 #[inline(always)]
 fn string_len(n: usize) -> u32 {
     4 + n as u32
@@ -882,97 +1235,6 @@ where
     Ok(())
 }
 
-#[derive(Debug)]
-#[must_use]
-pub struct ReceiveResponse<R> {
-    reader: R,
-    inner: Arc<Mutex<Inner>>,
-}
-
-impl<R> ReceiveResponse<R>
-where
-    R: AsyncRead + Unpin,
-{
-    pub async fn run(mut self) -> Result<()> {
-        loop {
-            let (id, resp) = self.receive_response().await?;
-
-            let inner = &mut *self.inner.lock().unwrap();
-            if let Some(tx) = inner.pending_requests.remove(&id) {
-                let _ = tx.send(resp);
-            }
-        }
-    }
-
-    async fn receive_response(&mut self) -> Result<(u32, Response)> {
-        let length = read_u32(&mut self.reader).await?;
-        let mut reader = AsyncReadExt::take(&mut self.reader, length as u64);
-
-        let typ = read_u8(&mut reader).await?;
-        let id = read_u32(&mut reader).await?;
-
-        let response = match typ {
-            SSH_FXP_STATUS => {
-                let code = read_u32(&mut reader).await?;
-                let message = read_string(&mut reader).await?;
-                let language_tag = read_string(&mut reader).await?;
-                Response::Status(RemoteStatus {
-                    code,
-                    message,
-                    language_tag,
-                })
-            }
-
-            SSH_FXP_HANDLE => {
-                let handle = read_string(&mut reader).await?;
-                Response::Handle(FileHandle(handle))
-            }
-
-            SSH_FXP_DATA => {
-                let data = read_string(&mut reader).await?;
-                Response::Data(data.into_vec())
-            }
-
-            SSH_FXP_ATTRS => {
-                let attrs = read_file_attr(&mut reader).await?;
-                Response::Attrs(attrs)
-            }
-
-            SSH_FXP_NAME => {
-                let count = read_u32(&mut reader).await?;
-                let mut entries = Vec::with_capacity(count as usize);
-                for _ in 0..count {
-                    let filename = read_string(&mut reader).await?;
-                    let longname = read_string(&mut reader).await?;
-                    let attrs = read_file_attr(&mut reader).await?;
-                    entries.push(DirEntry {
-                        filename,
-                        longname,
-                        attrs,
-                    });
-                }
-                Response::Name(entries)
-            }
-
-            SSH_FXP_EXTENDED_REPLY => {
-                let mut data = vec![];
-                reader.read_to_end(&mut data).await?;
-                Response::Extended(data)
-            }
-
-            typ => {
-                let mut data = vec![];
-                reader.read_to_end(&mut data).await?;
-                Response::Unknown { typ, data }
-            }
-        };
-
-        debug_assert_eq!(reader.limit(), 0);
-
-        Ok((id, response))
-    }
-}
-
 async fn read_u8<R>(mut r: R) -> Result<u8>
 where
     R: AsyncRead + Unpin,
@@ -1067,193 +1329,4 @@ where
         ac_mod_time,
         extended,
     })
-}
-
-#[derive(Debug)]
-enum Request {
-    Open {
-        filename: OsString,
-        pflags: u32,
-        attrs: FileAttr,
-    },
-    Close {
-        handle: OsString,
-    },
-    Read {
-        handle: OsString,
-        offset: u64,
-        len: u32,
-    },
-    Write {
-        handle: OsString,
-        offset: u64,
-        data: Vec<u8>,
-    },
-    LStat {
-        path: OsString,
-    },
-    FStat {
-        handle: OsString,
-    },
-    SetStat {
-        path: OsString,
-        attrs: FileAttr,
-    },
-    FSetStat {
-        handle: OsString,
-        attrs: FileAttr,
-    },
-    Opendir {
-        path: OsString,
-    },
-    Readdir {
-        handle: OsString,
-    },
-    Remove {
-        filename: OsString,
-    },
-    Mkdir {
-        path: OsString,
-        attrs: FileAttr,
-    },
-    Rmdir {
-        path: OsString,
-    },
-    Realpath {
-        path: OsString,
-    },
-    Stat {
-        path: OsString,
-    },
-    Rename {
-        oldpath: OsString,
-        newpath: OsString,
-    },
-    Readlink {
-        path: OsString,
-    },
-    Symlink {
-        linkpath: OsString,
-        targetpath: OsString,
-    },
-
-    Extended {
-        request: OsString,
-        data: Vec<u8>,
-    },
-}
-
-/// The kind of response values received from the server.
-#[derive(Debug)]
-enum Response {
-    /// The operation is failed.
-    Status(RemoteStatus),
-
-    /// An opened file handle.
-    Handle(FileHandle),
-
-    /// Received data.
-    Data(Vec<u8>),
-
-    /// Retrieved attribute values.
-    Attrs(FileAttr),
-
-    /// Directory entries.
-    Name(Vec<DirEntry>),
-
-    /// Reply from an vendor-specific extended request.
-    Extended(Vec<u8>),
-
-    /// The response type is unknown or currently not supported.
-    Unknown { typ: u8, data: Vec<u8> },
-}
-
-#[derive(Debug)]
-struct RemoteStatus {
-    code: u32,
-    message: OsString,
-    language_tag: OsString,
-}
-
-/// Start a SFTP session on the provided transport I/O.
-///
-/// This function first exchanges some packets with the server and negotiates
-/// the settings of SFTP protocol to use.  When the initialization process is
-/// successed, it returns a handle to send subsequent SFTP requests from the
-/// client and objects to drive the underlying communication with the server.
-pub async fn init<R, W>(
-    mut r: R,
-    mut w: W,
-    extensions: Vec<(OsString, OsString)>,
-) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>)>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    // send SSH_FXP_INIT packet.
-    w.write_all(&5u32.to_be_bytes()).await?; // length = type(= 1byte) + version(= 4byte)
-    w.write_all(&SSH_FXP_INIT.to_be_bytes()).await?;
-    w.write_all(&SFTP_PROTOCOL_VERSION.to_be_bytes()).await?;
-    for (name, data) in extensions {
-        write_string(&mut w, name.as_bytes()).await?;
-        write_string(&mut w, data.as_bytes()).await?;
-    }
-    w.flush().await?;
-
-    // receive SSH_FXP_VERSION packet.
-    let mut extensions = vec![];
-    {
-        let length = read_u32(&mut r).await?;
-        let mut r = AsyncReadExt::take(&mut r, length as u64);
-
-        let typ = read_u8(&mut r).await?;
-        if typ != SSH_FXP_VERSION {
-            return Err(Error::Protocol {
-                msg: "incorrect message type during initialization".into(),
-            });
-        }
-
-        let version = read_u32(&mut r).await?;
-        if version < SFTP_PROTOCOL_VERSION {
-            return Err(Error::Protocol {
-                msg: "server supports older SFTP protocol".into(),
-            });
-        }
-
-        loop {
-            match read_string(&mut r).await {
-                Ok(name) => {
-                    let data = read_string(&mut r).await?;
-                    extensions.push((name, data));
-                }
-                Err(Error::Transport(ref err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                    break
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    let (tx, rx) = mpsc::unbounded_channel();
-
-    let inner = Arc::new(Mutex::new(Inner {
-        extensions,
-        incoming_requests: tx,
-        pending_requests: HashMap::new(),
-        next_request_id: 0,
-    }));
-
-    let session = Session {
-        inner: Arc::downgrade(&inner),
-    };
-
-    let send = SendRequest {
-        writer: w,
-        inner: Arc::clone(&inner),
-        incoming_requests: rx,
-    };
-
-    let recv = ReceiveResponse { reader: r, inner };
-
-    Ok((session, send, recv))
 }

@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
 
     tracing::debug!("start SFTP");
 
-    let (sftp, send, recv) = sftp::init(r, w, vec![])
+    let (sftp, send, recv) = sftp::init(r, w)
         .await
         .context("failed to init SFTP session")?;
     tokio::spawn(send.run().instrument(tracing::debug_span!("send_request")));
