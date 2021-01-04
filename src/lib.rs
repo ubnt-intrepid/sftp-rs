@@ -1,16 +1,20 @@
 //! A pure-Rust implementation of SFTP client independent to transport layer.
 
 use crate::consts::*;
+use bytes::{Buf, Bytes, BytesMut};
+use futures::future::poll_fn;
 use std::{
     borrow::Cow,
     collections::HashMap,
     ffi::{OsStr, OsString},
     io,
+    mem::{self, MaybeUninit},
     os::unix::prelude::*,
+    pin::Pin,
     sync::{Arc, Mutex, Weak},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{mpsc, oneshot},
 };
 
@@ -442,7 +446,7 @@ impl Session {
     ) -> Result<Vec<u8>, Error> {
         let response = self.request(Request::Extended { request, data }).await?;
         match response {
-            Response::Extended(data) => Ok(data),
+            Response::Extended(data) => Ok(data.to_vec()),
             Response::Status(st) if st.code != SSH_FX_OK => Err(Error::Remote(RemoteError(st))),
             _ => Err(Error::Protocol {
                 msg: "incorrect response type".into(),
@@ -802,17 +806,22 @@ where
     }
 
     async fn receive_response(&mut self) -> Result<(u32, Response), Error> {
-        let length = read_u32(&mut self.reader).await?;
-        let mut reader = AsyncReadExt::take(&mut self.reader, length as u64);
+        let length = {
+            let mut buf = [0u8; 4];
+            self.reader.read_exact(&mut buf).await?;
+            u32::from_be_bytes(buf)
+        };
 
-        let typ = read_u8(&mut reader).await?;
-        let id = read_u32(&mut reader).await?;
+        let mut packet = read_packet(&mut self.reader, length as usize).await?;
+
+        let typ = read_u8(&mut packet)?;
+        let id = read_u32(&mut packet)?;
 
         let response = match typ {
             SSH_FXP_STATUS => {
-                let code = read_u32(&mut reader).await?;
-                let message = read_string(&mut reader).await?;
-                let language_tag = read_string(&mut reader).await?;
+                let code = read_u32(&mut packet)?;
+                let message = read_string(&mut packet)?;
+                let language_tag = read_string(&mut packet)?;
                 Response::Status(RemoteStatus {
                     code,
                     message,
@@ -821,27 +830,27 @@ where
             }
 
             SSH_FXP_HANDLE => {
-                let handle = read_string(&mut reader).await?;
+                let handle = read_string(&mut packet)?;
                 Response::Handle(FileHandle(handle.into_boxed_os_str().into()))
             }
 
             SSH_FXP_DATA => {
-                let data = read_string(&mut reader).await?;
+                let data = read_string(&mut packet)?;
                 Response::Data(data.into_vec())
             }
 
             SSH_FXP_ATTRS => {
-                let attrs = read_file_attr(&mut reader).await?;
+                let attrs = read_file_attr(&mut packet)?;
                 Response::Attrs(attrs)
             }
 
             SSH_FXP_NAME => {
-                let count = read_u32(&mut reader).await?;
+                let count = read_u32(&mut packet)?;
                 let mut entries = Vec::with_capacity(count as usize);
                 for _ in 0..count {
-                    let filename = read_string(&mut reader).await?;
-                    let longname = read_string(&mut reader).await?;
-                    let attrs = read_file_attr(&mut reader).await?;
+                    let filename = read_string(&mut packet)?;
+                    let longname = read_string(&mut packet)?;
+                    let attrs = read_file_attr(&mut packet)?;
                     entries.push(DirEntry {
                         filename,
                         longname,
@@ -852,19 +861,17 @@ where
             }
 
             SSH_FXP_EXTENDED_REPLY => {
-                let mut data = vec![];
-                reader.read_to_end(&mut data).await?;
+                let data = packet.split_to(packet.len());
                 Response::Extended(data)
             }
 
             typ => {
-                let mut data = vec![];
-                reader.read_to_end(&mut data).await?;
+                let data = packet.split_to(packet.len());
                 Response::Unknown { typ, data }
             }
         };
 
-        debug_assert_eq!(reader.limit(), 0);
+        debug_assert!(packet.is_empty());
 
         Ok((id, response))
     }
@@ -963,10 +970,10 @@ enum Response {
     Name(Vec<DirEntry>),
 
     /// Reply from an vendor-specific extended request.
-    Extended(Vec<u8>),
+    Extended(Bytes),
 
     /// The response type is unknown or currently not supported.
-    Unknown { typ: u8, data: Vec<u8> },
+    Unknown { typ: u8, data: Bytes },
 }
 
 #[derive(Debug)]
@@ -1050,39 +1057,33 @@ impl InitSession {
         w.flush().await?;
 
         // receive SSH_FXP_VERSION packet.
+        let length = {
+            let mut buf = [0u8; 4];
+            r.read_exact(&mut buf[..]).await?;
+            u32::from_be_bytes(buf)
+        };
+
+        let mut packet = read_packet(&mut r, length as usize).await?;
+
+        let typ = read_u8(&mut packet)?;
+        if typ != SSH_FXP_VERSION {
+            return Err(Error::Protocol {
+                msg: "incorrect message type during initialization".into(),
+            });
+        }
+
+        let version = read_u32(&mut packet)?;
+        if version < SFTP_PROTOCOL_VERSION {
+            return Err(Error::Protocol {
+                msg: "server supports older SFTP protocol".into(),
+            });
+        }
+
         let mut extensions = vec![];
-        {
-            let length = read_u32(&mut r).await?;
-            let mut r = AsyncReadExt::take(&mut r, length as u64);
-
-            let typ = read_u8(&mut r).await?;
-            if typ != SSH_FXP_VERSION {
-                return Err(Error::Protocol {
-                    msg: "incorrect message type during initialization".into(),
-                });
-            }
-
-            let version = read_u32(&mut r).await?;
-            if version < SFTP_PROTOCOL_VERSION {
-                return Err(Error::Protocol {
-                    msg: "server supports older SFTP protocol".into(),
-                });
-            }
-
-            loop {
-                match read_string(&mut r).await {
-                    Ok(name) => {
-                        let data = read_string(&mut r).await?;
-                        extensions.push((name, data));
-                    }
-                    Err(Error::Transport(ref err))
-                        if err.kind() == io::ErrorKind::UnexpectedEof =>
-                    {
-                        break
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
+        while !packet.is_empty() {
+            let name = read_string(&mut packet)?;
+            let data = read_string(&mut packet)?;
+            extensions.push((name, data));
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1226,77 +1227,113 @@ where
     Ok(())
 }
 
-async fn read_u8<R>(mut r: R) -> Result<u8, Error>
+async fn read_packet<R>(mut r: R, length: usize) -> io::Result<Bytes>
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = [0u8; 1];
-    r.read_exact(&mut buf).await?;
-    Ok(u8::from_be_bytes(buf))
+    let mut buf = BytesMut::with_capacity(length);
+
+    let mut read_buf = ReadBuf::uninit(unsafe {
+        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, length as usize)
+    });
+
+    while read_buf.remaining() > 0 {
+        poll_fn(|cx| Pin::new(&mut r).poll_read(cx, &mut read_buf)).await?;
+    }
+
+    assert!(read_buf.filled().len() >= length);
+    unsafe {
+        buf.set_len(length);
+    }
+
+    Ok(buf.freeze())
 }
 
-async fn read_u32<R>(mut r: R) -> Result<u32, Error>
+#[inline]
+fn ensure_buf_remaining(b: &impl Buf, n: usize) -> Result<(), Error> {
+    if b.remaining() >= n {
+        Ok(())
+    } else {
+        Err(Error::Protocol {
+            msg: "too short data".into(),
+        })
+    }
+}
+
+fn read_u8<B>(mut b: B) -> Result<u8, Error>
 where
-    R: AsyncRead + Unpin,
+    B: Buf,
 {
-    let mut buf = [0u8; 4];
-    r.read_exact(&mut buf).await?;
+    ensure_buf_remaining(&b, mem::size_of::<u8>())?;
+    let ret = b.chunk()[0];
+    b.advance(1);
+    Ok(ret)
+}
+
+fn read_u32<B>(mut b: B) -> Result<u32, Error>
+where
+    B: Buf,
+{
+    ensure_buf_remaining(&b, mem::size_of::<u32>())?;
+    let mut buf = [0u8; mem::size_of::<u32>()];
+    b.copy_to_slice(&mut buf[..]);
     Ok(u32::from_be_bytes(buf))
 }
 
-async fn read_u64<R>(mut r: R) -> Result<u64, Error>
+fn read_u64<B>(mut b: B) -> Result<u64, Error>
 where
-    R: AsyncRead + Unpin,
+    B: Buf,
 {
-    let mut buf = [0u8; 8];
-    r.read_exact(&mut buf).await?;
+    ensure_buf_remaining(&b, mem::size_of::<u64>())?;
+    let mut buf = [0u8; mem::size_of::<u64>()];
+    b.copy_to_slice(&mut buf[..]);
     Ok(u64::from_be_bytes(buf))
 }
 
-async fn read_string<R>(mut r: R) -> Result<OsString, Error>
+fn read_string<B>(mut b: B) -> Result<OsString, Error>
 where
-    R: AsyncRead + Unpin,
+    B: Buf,
 {
-    let len = read_u32(&mut r).await?;
+    let len = read_u32(&mut b)?;
+    ensure_buf_remaining(&b, len as usize)?;
 
     let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf[..]).await?;
-    let s = OsString::from_vec(buf);
+    b.copy_to_slice(&mut buf[..]);
 
-    Ok(s)
+    Ok(OsString::from_vec(buf))
 }
 
-async fn read_file_attr<R>(mut r: R) -> Result<FileAttr, Error>
+fn read_file_attr<B>(mut b: B) -> Result<FileAttr, Error>
 where
-    R: AsyncRead + Unpin,
+    B: Buf,
 {
-    let flags = read_u32(&mut r).await?;
+    let flags = read_u32(&mut b)?;
 
     let size = if flags & SSH_FILEXFER_ATTR_SIZE != 0 {
-        let size = read_u64(&mut r).await?;
+        let size = read_u64(&mut b)?;
         Some(size)
     } else {
         None
     };
 
     let uid_gid = if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
-        let uid = read_u32(&mut r).await?;
-        let gid = read_u32(&mut r).await?;
+        let uid = read_u32(&mut b)?;
+        let gid = read_u32(&mut b)?;
         Some((uid, gid))
     } else {
         None
     };
 
     let permissions = if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
-        let perm = read_u32(&mut r).await?;
+        let perm = read_u32(&mut b)?;
         Some(perm)
     } else {
         None
     };
 
     let ac_mod_time = if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
-        let atime = read_u32(&mut r).await?;
-        let mtime = read_u32(&mut r).await?;
+        let atime = read_u32(&mut b)?;
+        let mtime = read_u32(&mut b)?;
         Some((atime, mtime))
     } else {
         None
@@ -1305,10 +1342,10 @@ where
     let mut extended = vec![];
 
     if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
-        let count = read_u32(&mut r).await?;
+        let count = read_u32(&mut b)?;
         for _ in 0..count {
-            let ex_type = read_string(&mut r).await?;
-            let ex_data = read_string(&mut r).await?;
+            let ex_type = read_string(&mut b)?;
+            let ex_data = read_string(&mut b)?;
             extended.push((ex_type, ex_data));
         }
     }
