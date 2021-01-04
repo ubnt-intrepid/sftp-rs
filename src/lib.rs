@@ -1,7 +1,7 @@
 //! A pure-Rust implementation of SFTP client independent to transport layer.
 
 use crate::consts::*;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::future::poll_fn;
 use std::{
     borrow::Cow,
@@ -166,42 +166,32 @@ pub struct Session {
 }
 
 impl Session {
-    async fn request(&self, request: Request) -> Result<Response, Error> {
+    async fn request<F>(&self, packet_type: u8, f: F) -> Result<Response, Error>
+    where
+        F: FnOnce(&Inner, &mut Vec<u8>),
+    {
         let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
-
-        let rx = {
-            let pending_requests = &mut *inner.pending_requests.lock().unwrap();
-            let id = pending_requests.next_request_id;
-
-            inner.incoming_requests.send((id, request)).map_err(|_| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "session is not available")
-            })?;
-
-            let (tx, rx) = oneshot::channel();
-            pending_requests.senders.insert(id, tx);
-
-            pending_requests.next_request_id = pending_requests.next_request_id.wrapping_add(1);
-
-            rx
-        };
-
+        let rx = inner.send_request(packet_type, f)?;
         rx.await.map_err(|_| Error::SessionClosed)
     }
 
     /// Request to open a file.
     pub async fn open(
         &self,
-        filename: Cow<'static, OsStr>,
+        filename: impl AsRef<OsStr>,
         pflags: OpenFlag,
-        attrs: FileAttr,
+        attrs: &FileAttr,
     ) -> Result<FileHandle, Error> {
+        let filename = filename.as_ref();
+
         let response = self
-            .request(Request::Open {
-                filename,
-                pflags,
-                attrs,
+            .request(SSH_FXP_OPEN, |_, buf| {
+                put_string(&mut *buf, filename.as_bytes());
+                buf.put_u32(pflags.bits());
+                put_attrs(&mut *buf, attrs);
             })
             .await?;
+
         match response {
             Response::Handle(handle) => Ok(handle),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -212,8 +202,13 @@ impl Session {
     }
 
     /// Request to close a file corresponding to the specified handle.
-    pub async fn close(&self, handle: FileHandle) -> Result<(), Error> {
-        let response = self.request(Request::Close { handle }).await?;
+    pub async fn close(&self, handle: &FileHandle) -> Result<(), Error> {
+        let response = self
+            .request(SSH_FXP_CLOSE, |_, buf| {
+                put_string(&mut *buf, handle.0.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -224,14 +219,15 @@ impl Session {
     }
 
     /// Request to read a range of data from an opened file corresponding to the specified handle.
-    pub async fn read(&self, handle: FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
+    pub async fn read(&self, handle: &FileHandle, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
         let response = self
-            .request(Request::Read {
-                handle,
-                offset,
-                len,
+            .request(SSH_FXP_READ, |_, buf| {
+                put_string(&mut *buf, handle.0.as_bytes());
+                buf.put_u64(offset);
+                buf.put_u32(len);
             })
             .await?;
+
         match response {
             Response::Data(data) => Ok(data),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -242,19 +238,15 @@ impl Session {
     }
 
     /// Request to write a range of data to an opened file corresponding to the specified handle.
-    pub async fn write(
-        &self,
-        handle: FileHandle,
-        offset: u64,
-        data: Cow<'static, [u8]>,
-    ) -> Result<(), Error> {
+    pub async fn write(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<(), Error> {
         let response = self
-            .request(Request::Write {
-                handle,
-                offset,
-                data,
+            .request(SSH_FXP_WRITE, |_, buf| {
+                put_string(&mut *buf, handle.0.as_bytes());
+                buf.put_u64(offset);
+                buf.put(&*data);
             })
             .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -266,8 +258,15 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file, without following symbolic links.
     #[inline]
-    pub async fn lstat(&self, path: Cow<'static, OsStr>) -> Result<FileAttr, Error> {
-        let response = self.request(Request::LStat { path }).await?;
+    pub async fn lstat(&self, path: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_LSTAT, |_, buf| {
+                put_string(&mut *buf, path.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -279,8 +278,13 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn fstat(&self, handle: FileHandle) -> Result<FileAttr, Error> {
-        let response = self.request(Request::FStat { handle }).await?;
+    pub async fn fstat(&self, handle: &FileHandle) -> Result<FileAttr, Error> {
+        let response = self
+            .request(SSH_FXP_FSTAT, |_, buf| {
+                put_string(&mut *buf, handle.0.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -290,8 +294,16 @@ impl Session {
         }
     }
 
-    pub async fn setstat(&self, path: Cow<'static, OsStr>, attrs: FileAttr) -> Result<(), Error> {
-        let response = self.request(Request::SetStat { path, attrs }).await?;
+    pub async fn setstat(&self, path: impl AsRef<OsStr>, attrs: &FileAttr) -> Result<(), Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_SETSTAT, |_, buf| {
+                put_string(&mut *buf, path.as_bytes());
+                put_attrs(&mut *buf, attrs);
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -301,8 +313,14 @@ impl Session {
         }
     }
 
-    pub async fn fsetstat(&self, handle: FileHandle, attrs: FileAttr) -> Result<(), Error> {
-        let response = self.request(Request::FSetStat { handle, attrs }).await?;
+    pub async fn fsetstat(&self, handle: &FileHandle, attrs: &FileAttr) -> Result<(), Error> {
+        let response = self
+            .request(SSH_FXP_FSETSTAT, |_, buf| {
+                put_string(&mut *buf, handle.0.as_bytes());
+                put_attrs(&mut *buf, attrs);
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -313,8 +331,15 @@ impl Session {
     }
 
     /// Request to open a directory for reading.
-    pub async fn opendir(&self, path: Cow<'static, OsStr>) -> Result<FileHandle, Error> {
-        let response = self.request(Request::Opendir { path }).await?;
+    pub async fn opendir(&self, path: impl AsRef<OsStr>) -> Result<FileHandle, Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_OPENDIR, |_, buf| {
+                put_string(buf, path.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Handle(handle) => Ok(handle),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -325,8 +350,13 @@ impl Session {
     }
 
     /// Request to list files and directories contained in an opened directory.
-    pub async fn readdir(&self, handle: FileHandle) -> Result<Vec<DirEntry>, Error> {
-        let response = self.request(Request::Readdir { handle }).await?;
+    pub async fn readdir(&self, handle: &FileHandle) -> Result<Vec<DirEntry>, Error> {
+        let response = self
+            .request(SSH_FXP_READDIR, |_, buf| {
+                put_string(buf, handle.0.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Name(entries) => Ok(entries),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -336,8 +366,15 @@ impl Session {
         }
     }
 
-    pub async fn remove(&self, filename: Cow<'static, OsStr>) -> Result<(), Error> {
-        let response = self.request(Request::Remove { filename }).await?;
+    pub async fn remove(&self, filename: impl AsRef<OsStr>) -> Result<(), Error> {
+        let filename = filename.as_ref();
+
+        let response = self
+            .request(SSH_FXP_REMOVE, |_, buf| {
+                put_string(&mut *buf, filename.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -347,8 +384,16 @@ impl Session {
         }
     }
 
-    pub async fn mkdir(&self, path: Cow<'static, OsStr>, attrs: FileAttr) -> Result<(), Error> {
-        let response = self.request(Request::Mkdir { path, attrs }).await?;
+    pub async fn mkdir(&self, path: impl AsRef<OsStr>, attrs: &FileAttr) -> Result<(), Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_MKDIR, |_, buf| {
+                put_string(&mut *buf, path.as_bytes());
+                put_attrs(&mut *buf, attrs);
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -358,8 +403,15 @@ impl Session {
         }
     }
 
-    pub async fn rmdir(&self, path: Cow<'static, OsStr>) -> Result<(), Error> {
-        let response = self.request(Request::Rmdir { path }).await?;
+    pub async fn rmdir(&self, path: impl AsRef<OsStr>) -> Result<(), Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_RMDIR, |_, buf| {
+                put_string(&mut *buf, path.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -369,8 +421,15 @@ impl Session {
         }
     }
 
-    pub async fn realpath(&self, path: Cow<'static, OsStr>) -> Result<OsString, Error> {
-        let response = self.request(Request::Realpath { path }).await?;
+    pub async fn realpath(&self, path: impl AsRef<OsStr>) -> Result<OsString, Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_REALPATH, |_, buf| {
+                put_string(&mut *buf, path.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -382,8 +441,15 @@ impl Session {
 
     /// Request to retrieve attribute values for a named file.
     #[inline]
-    pub async fn stat(&self, path: Cow<'static, OsStr>) -> Result<FileAttr, Error> {
-        let response = self.request(Request::Stat { path }).await?;
+    pub async fn stat(&self, path: impl AsRef<OsStr>) -> Result<FileAttr, Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_STAT, |_, buf| {
+                put_string(buf, path.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Attrs(attrs) => Ok(attrs),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -395,10 +461,19 @@ impl Session {
 
     pub async fn rename(
         &self,
-        oldpath: Cow<'static, OsStr>,
-        newpath: Cow<'static, OsStr>,
+        oldpath: impl AsRef<OsStr>,
+        newpath: impl AsRef<OsStr>,
     ) -> Result<(), Error> {
-        let response = self.request(Request::Rename { oldpath, newpath }).await?;
+        let oldpath = oldpath.as_ref();
+        let newpath = newpath.as_ref();
+
+        let response = self
+            .request(SSH_FXP_RENAME, |_, buf| {
+                put_string(&mut *buf, oldpath.as_bytes());
+                put_string(&mut *buf, newpath.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -408,8 +483,15 @@ impl Session {
         }
     }
 
-    pub async fn readlink(&self, path: Cow<'static, OsStr>) -> Result<OsString, Error> {
-        let response = self.request(Request::Readlink { path }).await?;
+    pub async fn readlink(&self, path: impl AsRef<OsStr>) -> Result<OsString, Error> {
+        let path = path.as_ref();
+
+        let response = self
+            .request(SSH_FXP_READLINK, |_, buf| {
+                put_string(&mut *buf, path.as_bytes());
+            })
+            .await?;
+
         match response {
             Response::Name(mut entries) => Ok(entries.remove(0).filename),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -421,15 +503,24 @@ impl Session {
 
     pub async fn symlink(
         &self,
-        linkpath: Cow<'static, OsStr>,
-        targetpath: Cow<'static, OsStr>,
+        linkpath: impl AsRef<OsStr>,
+        targetpath: impl AsRef<OsStr>,
     ) -> Result<(), Error> {
+        let linkpath = linkpath.as_ref();
+        let targetpath = targetpath.as_ref();
+
         let response = self
-            .request(Request::Symlink {
-                linkpath,
-                targetpath,
+            .request(SSH_FXP_SYMLINK, |inner, buf| {
+                if inner.reverse_symlink_arguments {
+                    put_string(&mut *buf, targetpath.as_bytes());
+                    put_string(&mut *buf, linkpath.as_bytes());
+                } else {
+                    put_string(&mut *buf, linkpath.as_bytes());
+                    put_string(&mut *buf, targetpath.as_bytes());
+                }
             })
             .await?;
+
         match response {
             Response::Status(st) if st.code == SSH_FX_OK => Ok(()),
             Response::Status(st) => Err(Error::Remote(RemoteError(st))),
@@ -441,10 +532,18 @@ impl Session {
 
     pub async fn extended(
         &self,
-        request: Cow<'static, OsStr>,
-        data: Cow<'static, [u8]>,
+        request: impl AsRef<OsStr>,
+        data: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        let response = self.request(Request::Extended { request, data }).await?;
+        let request = request.as_ref();
+
+        let response = self
+            .request(SSH_FXP_EXTENDED, |_, buf| {
+                put_string(&mut *buf, request.as_bytes());
+                buf.put(data);
+            })
+            .await?;
+
         match response {
             Response::Extended(data) => Ok(data.to_vec()),
             Response::Status(st) if st.code != SSH_FX_OK => Err(Error::Remote(RemoteError(st))),
@@ -496,8 +595,34 @@ bitflags::bitflags! {
 struct Inner {
     extensions: Vec<(OsString, OsString)>,
     reverse_symlink_arguments: bool,
-    incoming_requests: mpsc::UnboundedSender<(u32, Request)>,
+    incoming_requests: mpsc::UnboundedSender<Vec<u8>>,
     pending_requests: Mutex<PendingRequests>,
+}
+
+impl Inner {
+    fn send_request<F>(&self, packet_type: u8, f: F) -> Result<oneshot::Receiver<Response>, Error>
+    where
+        F: FnOnce(&Inner, &mut Vec<u8>),
+    {
+        let pending_requests = &mut *self.pending_requests.lock().unwrap();
+        let id = pending_requests.next_request_id;
+
+        let mut buf = vec![];
+        buf.put_u8(packet_type);
+        buf.put_u32(id);
+        f(self, &mut buf);
+
+        self.incoming_requests.send(buf).map_err(|_| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "session is not available")
+        })?;
+
+        let (tx, rx) = oneshot::channel();
+        pending_requests.senders.insert(id, tx);
+
+        pending_requests.next_request_id = pending_requests.next_request_id.wrapping_add(1);
+
+        Ok(rx)
+    }
 }
 
 #[derive(Debug)]
@@ -511,7 +636,7 @@ struct PendingRequests {
 pub struct SendRequest<W> {
     writer: W,
     inner: Arc<Inner>,
-    incoming_requests: mpsc::UnboundedReceiver<(u32, Request)>,
+    incoming_requests: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 impl<W> SendRequest<W>
@@ -521,261 +646,12 @@ where
     pub async fn run(self) -> Result<(), Error> {
         let mut me = self;
 
-        while let Some((id, req)) = me.incoming_requests.recv().await {
-            match req {
-                Request::Open {
-                    filename,
-                    pflags,
-                    attrs,
-                } => {
-                    me.send_open_request(id, &filename, pflags.bits(), &attrs)
-                        .await?;
-                }
-
-                Request::Close { handle } => {
-                    me.send_string_request(id, SSH_FXP_CLOSE, &*handle.0)
-                        .await?;
-                }
-
-                Request::Read {
-                    handle,
-                    offset,
-                    len,
-                } => {
-                    me.send_read_request(id, &*handle.0, offset, len).await?;
-                }
-
-                Request::Write {
-                    handle,
-                    offset,
-                    data,
-                } => {
-                    me.send_write_request(id, &*handle.0, offset, &data).await?;
-                }
-
-                Request::LStat { path } => {
-                    me.send_string_request(id, SSH_FXP_LSTAT, &path).await?;
-                }
-
-                Request::FStat { handle } => {
-                    me.send_string_request(id, SSH_FXP_FSTAT, &*handle.0)
-                        .await?;
-                }
-
-                Request::SetStat { path, attrs } => {
-                    me.send_string_attrs_request(id, SSH_FXP_SETSTAT, &path, &attrs)
-                        .await?;
-                }
-
-                Request::FSetStat { handle, attrs } => {
-                    me.send_string_attrs_request(id, SSH_FXP_FSETSTAT, &*handle.0, &attrs)
-                        .await?;
-                }
-
-                Request::Opendir { path } => {
-                    me.send_string_request(id, SSH_FXP_OPENDIR, &path).await?;
-                }
-
-                Request::Readdir { handle } => {
-                    me.send_string_request(id, SSH_FXP_READDIR, &*handle.0)
-                        .await?;
-                }
-
-                Request::Remove { filename } => {
-                    me.send_string_request(id, SSH_FXP_REMOVE, &filename)
-                        .await?;
-                }
-
-                Request::Mkdir { path, attrs } => {
-                    me.send_string_attrs_request(id, SSH_FXP_MKDIR, &path, &attrs)
-                        .await?;
-                }
-
-                Request::Rmdir { path } => {
-                    me.send_string_request(id, SSH_FXP_RMDIR, &path).await?;
-                }
-
-                Request::Realpath { path } => {
-                    me.send_string_request(id, SSH_FXP_REALPATH, &path).await?;
-                }
-
-                Request::Stat { path } => {
-                    me.send_string_request(id, SSH_FXP_STAT, &path).await?;
-                }
-
-                Request::Rename {
-                    oldpath: oldname,
-                    newpath: newname,
-                } => {
-                    me.send_string_2_request(id, SSH_FXP_RENAME, &oldname, &newname)
-                        .await?;
-                }
-
-                Request::Readlink { path } => {
-                    me.send_string_request(id, SSH_FXP_READLINK, &path).await?;
-                }
-
-                Request::Symlink {
-                    ref linkpath,
-                    ref targetpath,
-                } if me.inner.reverse_symlink_arguments => {
-                    // In OpenSSH's sftp-server implementation, the order of arguments to SSH_FXP_SYMLINK
-                    // is inadvertently reversed and it is not fixed for compatibility reason.
-                    me.send_string_2_request(id, SSH_FXP_SYMLINK, &targetpath, &linkpath)
-                        .await?;
-                }
-
-                Request::Symlink {
-                    linkpath,
-                    targetpath,
-                } => {
-                    me.send_string_2_request(id, SSH_FXP_SYMLINK, &linkpath, &targetpath)
-                        .await?;
-                }
-
-                Request::Extended { request, data } => {
-                    me.send_extended_request(id, &request, &data).await?;
-                }
-            }
-
+        while let Some(packet) = me.incoming_requests.recv().await {
+            let length = packet.len() as u32;
+            me.writer.write_all(&length.to_be_bytes()).await?;
+            me.writer.write_all(&packet[..]).await?;
             me.writer.flush().await?;
         }
-
-        Ok(())
-    }
-
-    async fn send_string_request(
-        &mut self,
-        id: u32,
-        packet_type: u8,
-        s: &OsStr,
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + s(string)
-        let length = 1 + 4 + string_len(s.len());
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, packet_type).await?;
-        write_u32(&mut self.writer, id).await?;
-
-        write_string(&mut self.writer, s.as_bytes()).await?;
-
-        Ok(())
-    }
-
-    async fn send_string_2_request(
-        &mut self,
-        id: u32,
-        packet_type: u8,
-        s1: &OsStr,
-        s2: &OsStr,
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + s1(string) + s2(string)
-        let length = 1 + 4 + string_len(s1.len()) + string_len(s2.len());
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, packet_type).await?;
-        write_u32(&mut self.writer, id).await?;
-
-        write_string(&mut self.writer, s1.as_bytes()).await?;
-        write_string(&mut self.writer, s2.as_bytes()).await?;
-
-        Ok(())
-    }
-
-    async fn send_string_attrs_request(
-        &mut self,
-        id: u32,
-        packet_type: u8,
-        s: &OsStr,
-        attrs: &FileAttr,
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + s(string) + attrs
-        let length = 1 + 4 + string_len(s.len()) + attrs_len(attrs);
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, packet_type).await?;
-        write_u32(&mut self.writer, id).await?;
-
-        write_string(&mut self.writer, s.as_bytes()).await?;
-        write_attrs(&mut self.writer, attrs).await?;
-
-        Ok(())
-    }
-
-    async fn send_open_request(
-        &mut self,
-        id: u32,
-        filename: &OsStr,
-        pflags: u32,
-        attrs: &FileAttr,
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + filename(string) + pflags(u32) + attrs
-        let length = 1 + 4 + string_len(filename.len()) + 4 + attrs_len(attrs);
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, SSH_FXP_OPEN).await?;
-        write_u32(&mut self.writer, id).await?;
-        write_string(&mut self.writer, filename.as_bytes()).await?;
-        write_u32(&mut self.writer, pflags).await?;
-        write_attrs(&mut self.writer, &attrs).await?;
-        Ok(())
-    }
-
-    async fn send_read_request(
-        &mut self,
-        id: u32,
-        handle: &OsStr,
-        offset: u64,
-        len: u32,
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + handle(string) + offset(u64) + len(u32)
-        let length = 1 + 4 + string_len(handle.len()) + 8 + 4;
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, SSH_FXP_READ).await?;
-        write_u32(&mut self.writer, id).await?;
-        write_string(&mut self.writer, handle.as_bytes()).await?;
-        write_u64(&mut self.writer, offset).await?;
-        write_u32(&mut self.writer, len).await?;
-
-        Ok(())
-    }
-
-    async fn send_write_request(
-        &mut self,
-        id: u32,
-        handle: &OsStr,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + handle(string) + offset(u64) + data(string)
-        let length = 1 + 4 + string_len(handle.len()) + 8 + string_len(data.len());
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, SSH_FXP_WRITE).await?;
-        write_u32(&mut self.writer, id).await?;
-        write_string(&mut self.writer, handle.as_bytes()).await?;
-        write_u64(&mut self.writer, offset).await?;
-        write_string(&mut self.writer, data).await?;
-
-        Ok(())
-    }
-
-    async fn send_extended_request(
-        &mut self,
-        id: u32,
-        request: &OsStr,
-        data: &[u8],
-    ) -> Result<(), Error> {
-        // type(u8) + id(u32) + reqeust(string) + data(opaque bytes)
-        let length = 1 + 4 + string_len(request.len()) + data.len() as u32;
-
-        write_u32(&mut self.writer, length).await?;
-        write_u8(&mut self.writer, SSH_FXP_EXTENDED).await?;
-        write_u32(&mut self.writer, id).await?;
-
-        write_string(&mut self.writer, request.as_bytes()).await?;
-        self.writer.write_all(data).await?;
 
         Ok(())
     }
@@ -806,13 +682,7 @@ where
     }
 
     async fn receive_response(&mut self) -> Result<(u32, Response), Error> {
-        let length = {
-            let mut buf = [0u8; 4];
-            self.reader.read_exact(&mut buf).await?;
-            u32::from_be_bytes(buf)
-        };
-
-        let mut packet = read_packet(&mut self.reader, length as usize).await?;
+        let mut packet = read_packet(&mut self.reader).await?;
 
         let typ = read_u8(&mut packet)?;
         let id = read_u32(&mut packet)?;
@@ -875,80 +745,6 @@ where
 
         Ok((id, response))
     }
-}
-
-#[derive(Debug)]
-enum Request {
-    Open {
-        filename: Cow<'static, OsStr>,
-        pflags: OpenFlag,
-        attrs: FileAttr,
-    },
-    Close {
-        handle: FileHandle,
-    },
-    Read {
-        handle: FileHandle,
-        offset: u64,
-        len: u32,
-    },
-    Write {
-        handle: FileHandle,
-        offset: u64,
-        data: Cow<'static, [u8]>,
-    },
-    LStat {
-        path: Cow<'static, OsStr>,
-    },
-    FStat {
-        handle: FileHandle,
-    },
-    SetStat {
-        path: Cow<'static, OsStr>,
-        attrs: FileAttr,
-    },
-    FSetStat {
-        handle: FileHandle,
-        attrs: FileAttr,
-    },
-    Opendir {
-        path: Cow<'static, OsStr>,
-    },
-    Readdir {
-        handle: FileHandle,
-    },
-    Remove {
-        filename: Cow<'static, OsStr>,
-    },
-    Mkdir {
-        path: Cow<'static, OsStr>,
-        attrs: FileAttr,
-    },
-    Rmdir {
-        path: Cow<'static, OsStr>,
-    },
-    Realpath {
-        path: Cow<'static, OsStr>,
-    },
-    Stat {
-        path: Cow<'static, OsStr>,
-    },
-    Rename {
-        oldpath: Cow<'static, OsStr>,
-        newpath: Cow<'static, OsStr>,
-    },
-    Readlink {
-        path: Cow<'static, OsStr>,
-    },
-    Symlink {
-        linkpath: Cow<'static, OsStr>,
-        targetpath: Cow<'static, OsStr>,
-    },
-
-    Extended {
-        request: Cow<'static, OsStr>,
-        data: Cow<'static, [u8]>,
-    },
 }
 
 /// The kind of response values received from the server.
@@ -1047,23 +843,20 @@ impl InitSession {
         let mut w = w;
 
         // send SSH_FXP_INIT packet.
-        w.write_all(&5u32.to_be_bytes()).await?; // length = type(= 1byte) + version(= 4byte)
-        w.write_all(&SSH_FXP_INIT.to_be_bytes()).await?;
-        w.write_all(&SFTP_PROTOCOL_VERSION.to_be_bytes()).await?;
-        for (name, data) in &self.extensions {
-            write_string(&mut w, name.as_bytes()).await?;
-            write_string(&mut w, data.as_bytes()).await?;
-        }
-        w.flush().await?;
+        let packet = {
+            let mut buf = vec![];
+            buf.put_u8(SSH_FXP_INIT);
+            buf.put_u32(SFTP_PROTOCOL_VERSION);
+            for (name, data) in &self.extensions {
+                put_string(&mut buf, name.as_bytes());
+                put_string(&mut buf, data.as_bytes());
+            }
+            buf
+        };
+        write_packet(&mut w, &packet).await?;
 
         // receive SSH_FXP_VERSION packet.
-        let length = {
-            let mut buf = [0u8; 4];
-            r.read_exact(&mut buf[..]).await?;
-            u32::from_be_bytes(buf)
-        };
-
-        let mut packet = read_packet(&mut r, length as usize).await?;
+        let mut packet = read_packet(&mut r).await?;
 
         let typ = read_u8(&mut packet)?;
         if typ != SSH_FXP_VERSION {
@@ -1116,75 +909,18 @@ impl InitSession {
 
 // ==== misc ====
 
-#[inline(always)]
-fn string_len(n: usize) -> u32 {
-    4 + n as u32
-}
-
-async fn write_u8<W>(mut w: W, val: u8) -> Result<(), Error>
+#[inline]
+fn put_string<B>(mut b: B, s: &[u8])
 where
-    W: AsyncWrite + Unpin,
+    B: BufMut,
 {
-    w.write_all(&val.to_be_bytes()).await?;
-    Ok(())
+    b.put_u32(s.len() as u32);
+    b.put(s);
 }
 
-async fn write_u32<W>(mut w: W, val: u32) -> Result<(), Error>
+fn put_attrs<B>(mut b: B, attrs: &FileAttr)
 where
-    W: AsyncWrite + Unpin,
-{
-    w.write_all(&val.to_be_bytes()).await?;
-    Ok(())
-}
-
-async fn write_u64<W>(mut w: W, val: u64) -> Result<(), Error>
-where
-    W: AsyncWrite + Unpin,
-{
-    w.write_all(&val.to_be_bytes()).await?;
-    Ok(())
-}
-
-async fn write_string<W>(mut w: W, s: &[u8]) -> Result<(), Error>
-where
-    W: AsyncWrite + Unpin,
-{
-    w.write_all(&(s.len() as u32).to_be_bytes()).await?;
-    w.write_all(s).await?;
-    Ok(())
-}
-
-fn attrs_len(attrs: &FileAttr) -> u32 {
-    let mut len = 4u32; // flags
-    if attrs.size.is_some() {
-        len += 8; // size(u64)
-    }
-    if attrs.uid_gid.is_some() {
-        len += 8; // uid(u32) + gid(u32)
-    }
-    if attrs.permissions.is_some() {
-        len += 4; // permissions(u32)
-    }
-    if attrs.ac_mod_time.is_some() {
-        len += 8; // atime(u32) + mtime(u32)
-    }
-    if !attrs.extended.is_empty() {
-        len += 4; // extended_count(u32)
-        len += attrs
-            .extended
-            .iter()
-            .map(|(k, v)| {
-                // type_len(u32) + type(string) + data_len(4) + data(string)
-                4 + k.len() as u32 + 4 + v.len() as u32
-            })
-            .sum::<u32>();
-    }
-    len
-}
-
-async fn write_attrs<W>(mut w: W, attrs: &FileAttr) -> Result<(), Error>
-where
-    W: AsyncWrite + Unpin,
+    B: BufMut,
 {
     #[inline(always)]
     fn flag(b: bool, flag: u32) -> u32 {
@@ -1201,37 +937,52 @@ where
         | flag(attrs.ac_mod_time.is_some(), SSH_FILEXFER_ATTR_ACMODTIME)
         | flag(!attrs.extended.is_empty(), SSH_FILEXFER_ATTR_EXTENDED);
 
-    write_u32(&mut w, flags).await?;
+    b.put_u32(flags);
     if let Some(size) = attrs.size {
-        write_u64(&mut w, size).await?;
+        b.put_u64(size);
     }
     if let Some((uid, gid)) = attrs.uid_gid {
-        write_u32(&mut w, uid).await?;
-        write_u32(&mut w, gid).await?;
+        b.put_u32(uid);
+        b.put_u32(gid);
     }
     if let Some(perm) = attrs.permissions {
-        write_u32(&mut w, perm).await?;
+        b.put_u32(perm);
     }
     if let Some((atime, mtime)) = attrs.ac_mod_time {
-        write_u32(&mut w, atime).await?;
-        write_u32(&mut w, mtime).await?;
+        b.put_u32(atime);
+        b.put_u32(mtime);
     }
     if !attrs.extended.is_empty() {
-        write_u32(&mut w, attrs.extended.len() as u32).await?;
+        b.put_u32(attrs.extended.len() as u32);
         for (typ, data) in &attrs.extended {
-            write_string(&mut w, typ.as_bytes()).await?;
-            write_string(&mut w, data.as_bytes()).await?;
+            put_string(&mut b, typ.as_bytes());
+            put_string(&mut b, data.as_bytes());
         }
     }
+}
 
+async fn write_packet<W>(mut w: W, packet: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let length = packet.len() as u32;
+    w.write_all(&length.to_be_bytes()).await?;
+    w.write_all(&packet[..]).await?;
+    w.flush().await?;
     Ok(())
 }
 
-async fn read_packet<R>(mut r: R, length: usize) -> io::Result<Bytes>
+async fn read_packet<R>(mut r: R) -> io::Result<Bytes>
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = BytesMut::with_capacity(length);
+    let length = {
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf[..]).await?;
+        u32::from_be_bytes(buf)
+    };
+
+    let mut buf = BytesMut::with_capacity(length as usize);
 
     let mut read_buf = ReadBuf::uninit(unsafe {
         std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, length as usize)
@@ -1241,9 +992,9 @@ where
         poll_fn(|cx| Pin::new(&mut r).poll_read(cx, &mut read_buf)).await?;
     }
 
-    assert!(read_buf.filled().len() >= length);
+    assert!(read_buf.filled().len() >= length as usize);
     unsafe {
-        buf.set_len(length);
+        buf.set_len(length as usize);
     }
 
     Ok(buf.freeze())

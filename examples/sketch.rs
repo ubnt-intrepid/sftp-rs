@@ -1,6 +1,5 @@
 use anyhow::{Context as _, Result};
 use std::{
-    ffi::OsStr,
     net::{IpAddr, SocketAddr},
     process::Stdio,
 };
@@ -34,7 +33,7 @@ async fn main() -> Result<()> {
     tokio::spawn(recv.run().instrument(tracing::debug_span!("recv_response")));
 
     tracing::debug!(r#"stat(".")"#);
-    match sftp.stat(OsStr::new(".").into()).await {
+    match sftp.stat(".").await {
         Ok(attrs) => {
             tracing::debug!("--> {:?}", attrs);
         }
@@ -50,7 +49,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"realpath(".")"#);
-    match sftp.realpath(OsStr::new(".").into()).await {
+    match sftp.realpath(".").await {
         Ok(path) => {
             tracing::debug!("--> ok(path = {:?})", path);
         }
@@ -66,7 +65,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"stat("./foo.txt")"#);
-    match sftp.stat(OsStr::new("./foo.txt").into()).await {
+    match sftp.stat("./foo.txt").await {
         Ok(attrs) => {
             tracing::debug!("--> {:?}", attrs);
         }
@@ -81,7 +80,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"opendir(".")"#);
-    let dir = match sftp.opendir(OsStr::new(".").into()).await {
+    let dir = match sftp.opendir(".").await {
         Ok(dir) => {
             tracing::debug!("--> ok(handle = {:?})", dir);
             dir
@@ -98,7 +97,7 @@ async fn main() -> Result<()> {
     };
 
     tracing::debug!(r#"readdir({:?})"#, dir);
-    match sftp.readdir(dir.clone()).await {
+    match sftp.readdir(&dir).await {
         Ok(entries) => {
             tracing::debug!("--> ok(entries = {:?})", entries);
         }
@@ -114,7 +113,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::debug!(r#"close({:?})"#, dir);
-    match sftp.close(dir.clone()).await {
+    match sftp.close(&dir).await {
         Ok(()) => {
             tracing::debug!("--> ok");
         }
@@ -130,10 +129,7 @@ async fn main() -> Result<()> {
     };
 
     match sftp
-        .extended(
-            OsStr::new("statvfs@openssh.com").into(),
-            [0, 0, 0, 1, b'.'].as_ref().into(), /* = "." */
-        )
+        .extended("statvfs@openssh.com", &[0, 0, 0, 1, b'.'] /* = "." */)
         .await
     {
         Ok(data) => {
