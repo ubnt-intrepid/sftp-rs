@@ -2,6 +2,7 @@
 
 use crate::consts::*;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use dashmap::DashMap;
 use futures::{
     future::Future,
     ready,
@@ -9,13 +10,15 @@ use futures::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
     ffi::{OsStr, OsString},
     io,
     mem::{self, MaybeUninit},
     os::unix::prelude::*,
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Weak,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -175,8 +178,7 @@ impl Session {
         F: FnOnce(&Inner, &mut Vec<u8>),
     {
         let inner = self.inner.upgrade().ok_or(Error::SessionClosed)?;
-        let rx = inner.send_request(packet_type, f)?;
-        rx.await.map_err(|_| Error::SessionClosed)
+        inner.send_request(packet_type, f).await
     }
 
     /// Request to open a file.
@@ -600,16 +602,17 @@ struct Inner {
     extensions: Vec<(OsString, OsString)>,
     reverse_symlink_arguments: bool,
     incoming_requests: mpsc::UnboundedSender<Vec<u8>>,
-    pending_requests: Mutex<PendingRequests>,
+    pending_requests: DashMap<u32, oneshot::Sender<Response>>,
+    next_request_id: AtomicU32,
 }
 
 impl Inner {
-    fn send_request<F>(&self, packet_type: u8, f: F) -> Result<oneshot::Receiver<Response>, Error>
+    async fn send_request<F>(&self, packet_type: u8, f: F) -> Result<Response, Error>
     where
         F: FnOnce(&Inner, &mut Vec<u8>),
     {
-        let pending_requests = &mut *self.pending_requests.lock().unwrap();
-        let id = pending_requests.next_request_id;
+        // FIXME: choose appropriate atomic ordering.
+        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
 
         let mut buf = vec![];
         buf.put_u8(packet_type);
@@ -621,18 +624,10 @@ impl Inner {
         })?;
 
         let (tx, rx) = oneshot::channel();
-        pending_requests.senders.insert(id, tx);
+        self.pending_requests.insert(id, tx);
 
-        pending_requests.next_request_id = pending_requests.next_request_id.wrapping_add(1);
-
-        Ok(rx)
+        rx.await.map_err(|_| Error::SessionClosed)
     }
-}
-
-#[derive(Debug)]
-struct PendingRequests {
-    senders: HashMap<u32, oneshot::Sender<Response>>,
-    next_request_id: u32,
 }
 
 #[derive(Debug)]
@@ -845,9 +840,7 @@ where
 
                             debug_assert!(packet.is_empty());
 
-                            let pending_requests =
-                                &mut *self.inner.pending_requests.lock().unwrap();
-                            if let Some(tx) = pending_requests.senders.remove(&id) {
+                            if let Some((_id, tx)) = self.inner.pending_requests.remove(&id) {
                                 let _ = tx.send(response);
                             }
                         }
@@ -1004,10 +997,8 @@ impl InitSession {
             extensions,
             reverse_symlink_arguments: self.reverse_symlink_arguments,
             incoming_requests: tx,
-            pending_requests: Mutex::new(PendingRequests {
-                senders: HashMap::new(),
-                next_request_id: 0,
-            }),
+            pending_requests: DashMap::new(),
+            next_request_id: AtomicU32::new(0),
         });
 
         let session = Session {
