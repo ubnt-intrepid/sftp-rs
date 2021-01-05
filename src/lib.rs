@@ -636,39 +636,71 @@ struct PendingRequests {
 }
 
 #[derive(Debug)]
-#[must_use]
-pub struct SendRequest<W> {
-    writer: W,
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Connection<T> {
+    stream: T,
     inner: Arc<Inner>,
     incoming_requests: mpsc::UnboundedReceiver<Vec<u8>>,
-    state: SendRequestState,
+    send: SendRequest,
+    recv: RecvResponse,
 }
 
 #[derive(Debug)]
-enum SendRequestState {
-    WaitRequest,
+enum SendRequest {
+    Waiting,
     Writing {
         packet: bytes::buf::Chain<io::Cursor<[u8; 4]>, io::Cursor<Vec<u8>>>,
     },
-    Done,
+    Closed,
 }
 
-impl<W> Future for SendRequest<W>
+#[derive(Debug)]
+enum RecvResponse {
+    ReadLength {
+        buf: [u8; 4],
+        filled: usize,
+    },
+    ReadPacket {
+        buf: BytesMut,
+        inited: usize,
+        filled: usize,
+    },
+}
+
+impl<T> Future for Connection<T>
 where
-    W: AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
     type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
         let me = self.get_mut();
-        let mut w = Pin::new(&mut me.writer);
+
+        // FIXME: gracefully shutdown
+        let send = me.poll_send(cx)?;
+        let recv = me.poll_recv(cx)?;
+
+        if send.is_ready() && recv.is_ready() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<T> Connection<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_send(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
+        let mut w = Pin::new(&mut self.stream);
 
         loop {
-            match &mut me.state {
-                SendRequestState::WaitRequest => match ready!(me.incoming_requests.poll_recv(cx)) {
+            match &mut self.send {
+                SendRequest::Waiting => match ready!(self.incoming_requests.poll_recv(cx)) {
                     Some(packet) => {
                         let length = packet.len() as u32;
-                        me.state = SendRequestState::Writing {
+                        self.send = SendRequest::Writing {
                             packet: Buf::chain(
                                 io::Cursor::new(length.to_be_bytes()),
                                 io::Cursor::new(packet),
@@ -676,71 +708,31 @@ where
                         };
                     }
                     None => {
-                        me.state = SendRequestState::Done;
+                        self.send = SendRequest::Closed;
                         return Poll::Ready(Ok(()));
                     }
                 },
 
-                SendRequestState::Writing { packet } => {
+                SendRequest::Writing { packet } => {
                     while packet.remaining() > 0 {
                         let written = ready!(w.as_mut().poll_write(cx, packet.chunk()))?;
                         packet.advance(written);
                     }
                     ready!(w.as_mut().poll_flush(cx))?;
-                    me.state = SendRequestState::WaitRequest;
+                    self.send = SendRequest::Waiting;
                 }
 
-                SendRequestState::Done => panic!("future has already been polled"),
+                SendRequest::Closed => return Poll::Ready(Ok(())),
             }
         }
     }
-}
 
-#[derive(Debug)]
-#[must_use]
-pub struct ReceiveResponse<R> {
-    reader: R,
-    inner: Arc<Inner>,
-    state: ReceiveResponseState,
-}
-
-#[derive(Debug)]
-enum ReceiveResponseState {
-    Length {
-        buf: [u8; 4],
-        filled: usize,
-    },
-    Packet {
-        buf: BytesMut,
-        inited: usize,
-        filled: usize,
-    },
-}
-
-impl<R> Future for ReceiveResponse<R>
-where
-    R: AsyncRead + Unpin,
-{
-    type Output = Result<(), Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let me = self.get_mut();
-        loop {
-            ready!(me.poll_receive_response(cx))?;
-        }
-    }
-}
-
-impl<R> ReceiveResponse<R>
-where
-    R: AsyncRead + Unpin,
-{
-    fn poll_receive_response(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
-        let mut r = Pin::new(&mut self.reader);
+    fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
+        let mut r = Pin::new(&mut self.stream);
 
         loop {
-            match &mut self.state {
-                ReceiveResponseState::Length { buf, filled } => {
+            match &mut self.recv {
+                RecvResponse::ReadLength { buf, filled } => {
                     let mut read_buf = ReadBuf::new(buf);
                     read_buf.set_filled(*filled);
                     while read_buf.remaining() > 0 {
@@ -751,14 +743,14 @@ where
 
                     let length = u32::from_be_bytes(*buf);
                     let buf = BytesMut::with_capacity(length as usize);
-                    self.state = ReceiveResponseState::Packet {
+                    self.recv = RecvResponse::ReadPacket {
                         buf,
                         inited: 0,
                         filled: 0,
                     };
                 }
 
-                ReceiveResponseState::Packet {
+                RecvResponse::ReadPacket {
                     buf,
                     inited,
                     filled,
@@ -785,13 +777,13 @@ where
                     }
 
                     match std::mem::replace(
-                        &mut self.state,
-                        ReceiveResponseState::Length {
+                        &mut self.recv,
+                        RecvResponse::ReadLength {
                             buf: [0u8; 4],
                             filled: 0,
                         },
                     ) {
-                        ReceiveResponseState::Packet { buf, .. } => {
+                        RecvResponse::ReadPacket { buf, .. } => {
                             let mut packet = buf.freeze();
 
                             let typ = read_u8(&mut packet)?;
@@ -858,8 +850,6 @@ where
                             if let Some(tx) = pending_requests.senders.remove(&id) {
                                 let _ = tx.send(response);
                             }
-
-                            return Poll::Ready(Ok(()));
                         }
                         _ => unreachable!(),
                     }
@@ -904,12 +894,11 @@ struct RemoteStatus {
 /// Start a SFTP session on the provided transport I/O.
 ///
 /// This is a shortcut to `InitSession::default().init(r, w)`.
-pub async fn init<R, W>(r: R, w: W) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>), Error>
+pub async fn init<T>(stream: T) -> Result<(Session, Connection<T>), Error>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
-    InitSession::default().init(r, w).await
+    InitSession::default().init(stream).await
 }
 
 #[derive(Debug)]
@@ -952,17 +941,11 @@ impl InitSession {
     /// the settings of SFTP protocol to use.  When the initialization process is
     /// successed, it returns a handle to send subsequent SFTP requests from the
     /// client and objects to drive the underlying communication with the server.
-    pub async fn init<R, W>(
-        &self,
-        r: R,
-        w: W,
-    ) -> Result<(Session, SendRequest<W>, ReceiveResponse<R>), Error>
+    pub async fn init<T>(&self, stream: T) -> Result<(Session, Connection<T>), Error>
     where
-        R: AsyncRead + Unpin,
-        W: AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut r = r;
-        let mut w = w;
+        let mut stream = stream;
 
         // send SSH_FXP_INIT packet.
         let packet = {
@@ -976,20 +959,20 @@ impl InitSession {
             buf
         };
         let length = packet.len() as u32;
-        w.write_all(&length.to_be_bytes()).await?;
-        w.write_all(&packet[..]).await?;
-        w.flush().await?;
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(&packet[..]).await?;
+        stream.flush().await?;
 
         // receive SSH_FXP_VERSION packet.
         let length = {
             let mut buf = [0u8; 4];
-            r.read_exact(&mut buf[..]).await?;
+            stream.read_exact(&mut buf[..]).await?;
             u32::from_be_bytes(buf)
         };
 
         let packet = {
             let mut buf = vec![0u8; length as usize];
-            r.read_exact(&mut buf[..]).await?;
+            stream.read_exact(&mut buf[..]).await?;
             buf
         };
         let mut packet = &packet[..];
@@ -1031,23 +1014,18 @@ impl InitSession {
             inner: Arc::downgrade(&inner),
         };
 
-        let send = SendRequest {
-            writer: w,
-            inner: Arc::clone(&inner),
-            incoming_requests: rx,
-            state: SendRequestState::WaitRequest,
-        };
-
-        let recv = ReceiveResponse {
-            reader: r,
+        let conn = Connection {
+            stream,
             inner,
-            state: ReceiveResponseState::Length {
+            incoming_requests: rx,
+            send: SendRequest::Waiting,
+            recv: RecvResponse::ReadLength {
                 buf: [0u8; 4],
                 filled: 0,
             },
         };
 
-        Ok((session, send, recv))
+        Ok((session, conn))
     }
 }
 

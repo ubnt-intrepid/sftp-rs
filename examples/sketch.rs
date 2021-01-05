@@ -1,9 +1,15 @@
 use anyhow::{Context as _, Result};
+use futures::task::{self, Poll};
 use std::{
+    io::{self, IoSlice},
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     process::Stdio,
 };
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 use tracing::Instrument as _;
 
 #[tokio::main]
@@ -22,15 +28,14 @@ async fn main() -> Result<()> {
     tracing::debug!(?addr);
     tracing::debug!(?username);
 
-    let (mut child, r, w) = establish_connection(&addr, &username)?;
+    let (mut child, stream) = establish_connection(&addr, &username)?;
 
     tracing::debug!("start SFTP");
 
-    let (sftp, send, recv) = sftp::init(r, w)
+    let (sftp, conn) = sftp::init(stream)
         .await
         .context("failed to init SFTP session")?;
-    tokio::spawn(send.instrument(tracing::debug_span!("send_request")));
-    tokio::spawn(recv.instrument(tracing::debug_span!("recv_response")));
+    tokio::spawn(conn.instrument(tracing::debug_span!("sftp_conn")));
 
     tracing::debug!(r#"stat(".")"#);
     match sftp.stat(".").await {
@@ -152,10 +157,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn establish_connection(
-    addr: &SocketAddr,
-    username: &str,
-) -> Result<(Child, ChildStdout, ChildStdin)> {
+fn establish_connection(addr: &SocketAddr, username: &str) -> Result<(Child, Stream)> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-p")
         .arg(addr.port().to_string())
@@ -170,5 +172,48 @@ fn establish_connection(
     let reader = child.stdout.take().expect("missing stdout pipe");
     let writer = child.stdin.take().expect("missing stdin pipe");
 
-    Ok((child, reader, writer))
+    let stream = Stream { reader, writer };
+
+    Ok((child, stream))
+}
+
+struct Stream {
+    reader: ChildStdout,
+    writer: ChildStdin,
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().writer).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+    }
 }
